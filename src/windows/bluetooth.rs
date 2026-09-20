@@ -526,6 +526,17 @@ impl WindowsBluetoothManager {
 }
 
 impl BluetoothManager for WindowsBluetoothManager {
+    fn update_reason(&self, current: &BluetoothDevice, desired: &BluetoothDevice) -> Option<String> {
+        let (Some(local), Some(shared)) = (&current.le, &desired.le) else { return None; };
+        if let (Some(local_irk), Some(shared_irk)) = (&local.irk, &shared.irk) {
+            if !local_irk.eq_ignore_ascii_case(shared_irk)
+                && shared.irk_encoding.as_deref() != Some("windows") {
+                return Some("conflicting legacy IRK encoding; preserving live Windows bond".into());
+            }
+        }
+        None
+    }
+
     fn migrate_shared_config(&self, config: &mut crate::config::BlueVeinConfig) -> Result<(), Box<dyn Error>> {
         for adapter_mac in self.get_adapters()? {
             // Registry reads establish the format of matching legacy IRKs.
@@ -753,6 +764,20 @@ fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untagged_conflicting_irk_cannot_overwrite_live_windows_bond() {
+        let manager = WindowsBluetoothManager::new().unwrap();
+        let mut local = BluetoothDevice::le_with_ltk("AA:BB:CC:DD:EE:FF".into(), key());
+        local.le.as_mut().unwrap().irk = Some("22".repeat(16));
+        local.le.as_mut().unwrap().irk_encoding = Some("windows".into());
+        let mut shared = local.clone();
+        shared.le.as_mut().unwrap().irk = Some("33".repeat(16));
+        shared.le.as_mut().unwrap().irk_encoding = None;
+        assert!(manager.update_reason(&local, &shared).is_some());
+        shared.le.as_mut().unwrap().irk_encoding = Some("windows".into());
+        assert!(manager.update_reason(&local, &shared).is_none());
+    }
 
     #[test]
     fn windows_registry_round_trip_converges_without_touching_system_bonds() {
