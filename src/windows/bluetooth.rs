@@ -764,9 +764,16 @@ fn windows_ltk_type(authenticated: Option<u8>, auth_req: Option<u32>, ediv: Opti
 }
 
 fn decode_cached_name(bytes: &[u8], kind: RegType) -> Option<String> {
-    let utf16 = matches!(kind, RegType::REG_SZ | RegType::REG_EXPAND_SZ)
-        || (bytes.len() >= 4 && bytes.len() % 2 == 0
-            && bytes.chunks_exact(2).take(8).any(|pair| pair[1] == 0));
+    let string_value = matches!(kind, RegType::REG_SZ | RegType::REG_EXPAND_SZ);
+    if !string_value {
+        if let Ok(value) = std::str::from_utf8(bytes) {
+            let value = value.trim_end_matches('\0').trim();
+            if !value.is_empty() && !value.chars().any(char::is_control) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    let utf16 = string_value || bytes.len() % 2 == 0;
     let name = if utf16 {
         if bytes.len() % 2 != 0 { return None; }
         let units: Vec<u16> = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
