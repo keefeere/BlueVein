@@ -102,3 +102,10 @@ Windows identity records. CI runs on pull requests as well as the fork branch.
 
 Record OS/BlueZ versions, tested binary commit, pass/fail for each step, and
 sanitized error/event summaries. Do not claim hardware validation from CI.
+
+## Follow-up candidate validation (2026-09-20)
+
+Commit `3785471` passed 45 Windows tests and 30 Linux tests, with both release
+builds. It was deployed over the initial fix using the same backup, audit and
+registry-preservation checks. The maintainer confirmed cursor and keyboard input
+still work in Windows. Linux hardware and return-to-Windows checks remain pending.
