@@ -653,14 +653,23 @@ impl BluetoothManager for LinuxBluetoothManager {
         }
         let adapter_path = adapter_path.ok_or("Bluetooth adapter is not exported by BlueZ")?;
         let device_path = format!("{}/dev_{}", adapter_path, normalize_mac(device_mac).replace(':', "_"));
-        let result = Command::new("busctl").args([
-            "call", "org.bluez", &adapter_path, "org.bluez.Adapter1", "RemoveDevice", "o", &device_path,
-        ]).output()?;
-        if !result.status.success() {
-            return Err(format!("BlueZ refused to remove {}: {}", device_mac,
-                String::from_utf8_lossy(&result.stderr).trim()).into());
+        // BlueZ can expose the adapter before it is ready to process removals
+        // during boot. Keep the deletion marker while retrying this one D-Bus
+        // call; restarting the whole service would rerun unrelated imports.
+        for attempt in 0..7 {
+            let result = Command::new("busctl").args([
+                "call", "org.bluez", &adapter_path, "org.bluez.Adapter1", "RemoveDevice", "o", &device_path,
+            ]).output()?;
+            if result.status.success() { return Ok(()); }
+            if !Self::get_device_info_path(adapter_mac, device_mac).exists() { return Ok(()); }
+            let error = String::from_utf8_lossy(&result.stderr);
+            let transient = error.contains("Resource Not Ready") || error.contains("NotReady");
+            if !transient || attempt == 6 {
+                return Err(format!("BlueZ refused to remove {}: {}", device_mac, error.trim()).into());
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
         }
-        Ok(())
+        unreachable!()
     }
 }
 
