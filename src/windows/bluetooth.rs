@@ -872,6 +872,46 @@ mod tests {
     }
 
     #[test]
+    fn local_sc_rekey_replaces_stale_shared_peripheral_key() {
+        let manager = WindowsBluetoothManager::new().unwrap();
+        let mut local = BluetoothDevice::le_with_ltk("12:34:56:78:9A:BC".into(), key());
+        let mut shared = local.clone();
+        shared.le.as_mut().unwrap().peripheral_ltk = Some(key());
+        for security_type in [2, 3] {
+            let ltk = local.le.as_mut().unwrap().ltk.as_mut().unwrap();
+            ltk.key = "77".repeat(16);
+            ltk.authenticated = Some(security_type);
+            let prepared = manager.prepare_local_export(&local, &shared);
+            let result = shared.merge_with(&prepared);
+            let le = result.le.unwrap();
+            assert_eq!(le.peripheral_ltk, le.ltk);
+            assert_eq!(le.ltk.unwrap().key, "77".repeat(16));
+        }
+        // A legacy key cannot replace a different role's key.
+        local.le.as_mut().unwrap().ltk.as_mut().unwrap().authenticated = Some(1);
+        let result = shared.merge_with(&manager.prepare_local_export(&local, &shared));
+        assert_eq!(result.le.unwrap().peripheral_ltk, shared.le.unwrap().peripheral_ltk);
+    }
+
+    #[test]
+    fn conflicting_complete_identity_bonds_refuse_reads_and_imports() {
+        let (hkcu, root, mut manager) = identity_fixture("complete-conflict");
+        let keys = manager.open_bluetooth_keys().unwrap();
+        let adapter = keys.open_subkey_with_flags("001122334455", KEY_ALL_ACCESS).unwrap();
+        let shadow = adapter.open_subkey_with_flags("123456789abc", KEY_ALL_ACCESS).unwrap();
+        shadow.set_raw_value("LTK", &winreg::RegValue {
+            bytes: vec![0x88; 16], vtype: RegType::REG_BINARY,
+        }).unwrap();
+        assert!(manager.get_devices("00:11:22:33:44:55").is_err());
+        let desired = BluetoothDevice::le_with_ltk("12:34:56:78:9A:BC".into(), key());
+        assert!(manager.set_device("00:11:22:33:44:55", &desired).is_err());
+        assert_eq!(shadow.get_raw_value("LTK").unwrap().bytes, vec![0x88; 16]);
+        assert_eq!(adapter.open_subkey("412233445566").unwrap().get_raw_value("LTK").unwrap().bytes, vec![0x11; 16]);
+        drop(manager);
+        hkcu.delete_subkey_all(&root).unwrap();
+    }
+
+    #[test]
     fn sc_security_type_is_not_inferred_from_requested_mitm() {
         assert_eq!(windows_ltk_type(None, Some(0x2d), Some(0), Some(0)), 2);
         assert_eq!(windows_ltk_type(Some(1), Some(0x2d), Some(0), Some(0)), 3);

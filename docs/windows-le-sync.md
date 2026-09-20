@@ -78,3 +78,27 @@ The replacement service remained running across multiple periodic checks without
 new key-mismatch or error messages. Physical Linux reconnect and return-to-Windows
 validation remain outstanding; these results are not a claim of completed hardware
 validation.
+
+## Test candidate after the initial deployment
+
+EFI writes now require a complete configuration read-back match. Missing or
+unreadable output is an error, so the Windows monitor retries the export before
+allowing another import. Linux startup also propagates a failed initial sync
+instead of entering its export monitor after an incomplete import.
+
+Regression coverage includes dropped writes, unreadable read-back, retry after a
+failed export, both SC security types during rekey, and conflicting complete
+Windows identity records. CI runs on pull requests as well as the fork branch.
+
+### Hardware acceptance checklist
+
+1. Keep the existing pairing and boot Linux. Confirm EFI and BlueZ identity,
+   LTK/IRK and role-key equality privately; never paste key files into an issue.
+2. Verify cursor movement and keyboard input, then disconnect/reconnect the app.
+3. Suspend/resume Linux and repeat input and reconnect checks.
+4. Boot Windows again and repeat input/reconnect checks. Confirm the service
+   remains running and does not repeatedly rewrite unchanged keys.
+5. Confirm headphones and the pre-existing Mac pairing still work.
+
+Record OS/BlueZ versions, tested binary commit, pass/fail for each step, and
+sanitized error/event summaries. Do not claim hardware validation from CI.
