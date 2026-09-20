@@ -72,17 +72,15 @@ impl WindowsBluetoothManager {
         adapter_mac: &str,
         device_mac: &str,
     ) -> Result<Option<ClassicKeys>, Box<dyn Error>> {
-        let bt_keys = match self.open_bluetooth_keys() {
-            Ok(keys) => keys,
-            Err(_) => return Ok(None),
-        };
+        let bt_keys = self.open_bluetooth_keys()?;
 
         let adapter_key_name = mac_to_windows_format(adapter_mac);
         let device_key_name = mac_to_windows_format(device_mac);
 
         let adapter_key = match bt_keys.open_subkey_with_flags(&adapter_key_name, KEY_READ) {
             Ok(key) => key,
-            Err(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
         };
 
         // Read raw value as binary
@@ -111,22 +109,21 @@ impl WindowsBluetoothManager {
         adapter_mac: &str,
         device_mac: &str,
     ) -> Result<Option<LeKeys>, Box<dyn Error>> {
-        let bt_le_keys = match self.open_bluetooth_le_keys() {
-            Ok(keys) => keys,
-            Err(_) => return Ok(None),
-        };
+        let bt_le_keys = self.open_bluetooth_le_keys()?;
 
         let adapter_key_name = mac_to_windows_format(adapter_mac);
         let device_key_name = mac_to_windows_format(device_mac);
 
         let adapter_key = match bt_le_keys.open_subkey_with_flags(&adapter_key_name, KEY_READ) {
             Ok(key) => key,
-            Err(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
         };
 
         let device_key = match adapter_key.open_subkey_with_flags(&device_key_name, KEY_READ) {
             Ok(key) => key,
-            Err(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
         };
 
         let mut le_keys = LeKeys::default();
@@ -451,97 +448,40 @@ impl BluetoothManager for WindowsBluetoothManager {
     }
 
     fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>> {
+        // Classic and LE use the same root. An unreadable root is not an empty
+        // Bluetooth configuration: propagate failure rather than importing over it.
+        let keys = self.open_bluetooth_keys()?;
         let mut adapters = Vec::new();
-
-        // Check classic Bluetooth adapters
-        if let Ok(bt_keys) = self.open_bluetooth_keys() {
-            for adapter in bt_keys.enum_keys() {
-                if let Ok(adapter_name) = adapter {
-                    if !is_valid_mac_hex(&adapter_name) {
-                        continue;
-                    }
-                    let mac = windows_format_to_mac(&adapter_name);
-                    if !adapters.contains(&mac) {
-                        adapters.push(mac);
-                    }
-                }
+        for name in keys.enum_keys() {
+            let name = name?;
+            if is_valid_mac_hex(&name) {
+                adapters.push(windows_format_to_mac(&name));
             }
         }
-
-        // Check LE adapters
-        if let Ok(bt_le_keys) = self.open_bluetooth_le_keys() {
-            for adapter in bt_le_keys.enum_keys() {
-                if let Ok(adapter_name) = adapter {
-                    if !is_valid_mac_hex(&adapter_name) {
-                        continue;
-                    }
-                    let mac = windows_format_to_mac(&adapter_name);
-                    if !adapters.contains(&mac) {
-                        adapters.push(mac);
-                    }
-                }
-            }
-        }
-
         Ok(adapters)
     }
 
     fn get_devices(&self, adapter_mac: &str) -> Result<Vec<BluetoothDevice>, Box<dyn Error>> {
-        let mut devices_map: std::collections::HashMap<String, BluetoothDevice> =
-            std::collections::HashMap::new();
-
-        // Read classic devices
-        if let Ok(bt_keys) = self.open_bluetooth_keys() {
-            let adapter_key_name = mac_to_windows_format(adapter_mac);
-            if let Ok(adapter_key) = bt_keys.open_subkey_with_flags(&adapter_key_name, KEY_READ) {
-                for device in adapter_key.enum_values() {
-                    if let Ok((device_name, _)) = device {
-                        // Skip special registry values like "CentralIRK", "LocalIRK" etc.
-                        if !is_valid_mac_hex(&device_name) {
-                            continue;
-                        }
-                        let device_mac = windows_format_to_mac(&device_name);
-                        if let Ok(Some(classic)) =
-                            self.read_classic_device(adapter_mac, &device_mac)
-                        {
-                            devices_map
-                                .entry(device_mac.clone())
-                                .or_insert_with(|| BluetoothDevice {
-                                    mac_address: device_mac.clone(),
-                                    classic: None,
-                                    le: None,
-                                })
-                                .classic = Some(classic);
-                        }
-                    }
-                }
+        let keys = self.open_bluetooth_keys()?;
+        let adapter = keys.open_subkey_with_flags(mac_to_windows_format(adapter_mac), KEY_READ)?;
+        let mut names = std::collections::BTreeSet::new();
+        for value in adapter.enum_values() {
+            let (name, _) = value?;
+            if is_valid_mac_hex(&name) { names.insert(windows_format_to_mac(&name)); }
+        }
+        for name in adapter.enum_keys() {
+            let name = name?;
+            if is_valid_mac_hex(&name) { names.insert(windows_format_to_mac(&name)); }
+        }
+        let mut devices = Vec::new();
+        for mac in names {
+            let classic = self.read_classic_device(adapter_mac, &mac)?;
+            let le = self.read_le_device(adapter_mac, &mac)?;
+            if classic.is_some() || le.is_some() {
+                devices.push(BluetoothDevice { mac_address: mac, classic, le });
             }
         }
-
-        // Read LE devices
-        if let Ok(bt_le_keys) = self.open_bluetooth_le_keys() {
-            let adapter_key_name = mac_to_windows_format(adapter_mac);
-            if let Ok(adapter_key) = bt_le_keys.open_subkey_with_flags(&adapter_key_name, KEY_READ)
-            {
-                for device in adapter_key.enum_keys() {
-                    if let Ok(device_name) = device {
-                        let device_mac = windows_format_to_mac(&device_name);
-                        if let Ok(Some(le)) = self.read_le_device(adapter_mac, &device_mac) {
-                            devices_map
-                                .entry(device_mac.clone())
-                                .or_insert_with(|| BluetoothDevice {
-                                    mac_address: device_mac.clone(),
-                                    classic: None,
-                                    le: None,
-                                })
-                                .le = Some(le);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(devices_map.into_iter().map(|(_, device)| device).collect())
+        Ok(devices)
     }
 
     fn get_device(

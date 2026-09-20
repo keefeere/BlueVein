@@ -52,10 +52,7 @@ pub fn run_sync_loop() -> Result<(), Box<dyn Error>> {
     let mut sync_manager = SyncManager::new(bt_manager, efi_context);
 
     log!("[BlueVein] Performing initial bidirectional sync...");
-    if let Err(e) = sync_manager.sync_bidirectional() {
-        log!("[BlueVein] Warning: Initial sync failed: {}", e);
-        log!("[BlueVein] Continuing with monitoring...");
-    }
+    sync_manager.sync_bidirectional()?;
 
     let running = Arc::new(AtomicBool::new(true));
 

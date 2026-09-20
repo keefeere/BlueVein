@@ -170,11 +170,7 @@ impl SyncManager {
                     }
                 }
                 Err(e) => {
-                    log!(
-                        "[BlueVein] Error reading devices for adapter {}: {}",
-                        adapter_mac,
-                        e
-                    );
+                    return Err(format!("Failed to read adapter {}: {}", adapter_mac, e).into());
                 }
             }
         }
@@ -210,11 +206,9 @@ impl SyncManager {
                                         Ok(_) => {
                                             log!("[BlueVein]   ✓ Updated device {}", device_mac)
                                         }
-                                        Err(e) => log!(
-                                            "[BlueVein]   ✗ Failed to update device {}: {}",
-                                            device_mac,
-                                            e
-                                        ),
+                                        Err(e) => return Err(format!(
+                                            "Failed to update device {}: {}", device_mac, e
+                                        ).into()),
                                     }
                                 } else {
                                     log!(
@@ -578,18 +572,23 @@ mod tests {
         shared: BlueVeinConfig,
         local_writes: usize,
         shared_writes: usize,
+        fail_local_read: bool,
+        fail_local_write: bool,
     }
     struct Backend(Arc<Mutex<State>>);
     impl BluetoothManager for Backend {
         fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>> { Ok(vec!["adapter".into()]) }
         fn get_devices(&self, _: &str) -> Result<Vec<BluetoothDevice>, Box<dyn Error>> {
-            Ok(self.0.lock().unwrap().local.values().cloned().collect())
+            let state = self.0.lock().unwrap();
+            if state.fail_local_read { return Err("simulated unreadable registry".into()); }
+            Ok(state.local.values().cloned().collect())
         }
         fn get_device(&self, _: &str, mac: &str) -> Result<BluetoothDevice, Box<dyn Error>> {
             self.0.lock().unwrap().local.get(mac).cloned().ok_or_else(|| "missing".into())
         }
         fn set_device(&mut self, _: &str, device: &BluetoothDevice) -> Result<(), Box<dyn Error>> {
             let mut state = self.0.lock().unwrap();
+            if state.fail_local_write { return Err("simulated failed registry write".into()); }
             state.local.insert(device.mac_address.clone(), device.clone());
             state.local_writes += 1;
             Ok(())
@@ -615,6 +614,27 @@ mod tests {
         state.shared.update_device("adapter".into(), shared);
         let state = Arc::new(Mutex::new(state));
         (SyncManager { bt_manager: Box::new(Backend(state.clone())), store: Box::new(Store(state.clone())) }, state)
+    }
+
+    #[test]
+    fn failed_local_read_does_not_publish_a_partial_shared_state() {
+        let (mut sync, state) = setup(device("11"), device("22"));
+        state.lock().unwrap().fail_local_read = true;
+        assert!(sync.sync_bidirectional().is_err());
+        let state = state.lock().unwrap();
+        assert_eq!(state.shared_writes, 0);
+        assert_eq!(state.local_writes, 0);
+    }
+
+    #[test]
+    fn failed_local_import_is_not_published_as_a_successful_merge() {
+        let (mut sync, state) = setup(device("11"), device("22"));
+        state.lock().unwrap().fail_local_write = true;
+        assert!(sync.sync_bidirectional().is_err());
+        let state = state.lock().unwrap();
+        assert_eq!(state.shared_writes, 0);
+        assert_eq!(state.local_writes, 0);
+        assert_eq!(state.local.get("phone"), Some(&device("11")));
     }
 
     #[test]
