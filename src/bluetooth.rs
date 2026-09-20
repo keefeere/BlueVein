@@ -199,6 +199,11 @@ pub trait BluetoothManager: Send {
         current != desired
     }
 
+    /// Retain metadata the local backend cannot observe when the key is unchanged.
+    fn prepare_local_export(&self, local: &BluetoothDevice, _shared: &BluetoothDevice) -> BluetoothDevice {
+        local.clone()
+    }
+
     /// Get list of Bluetooth adapter MAC addresses
     fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>>;
 

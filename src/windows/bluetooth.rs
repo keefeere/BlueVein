@@ -435,6 +435,17 @@ impl WindowsBluetoothManager {
 }
 
 impl BluetoothManager for WindowsBluetoothManager {
+    fn prepare_local_export(&self, local: &BluetoothDevice, shared: &BluetoothDevice) -> BluetoothDevice {
+        let mut result = local.clone();
+        if let (Some(local), Some(shared)) = (&mut result.classic, &shared.classic) {
+            if local.link_key.eq_ignore_ascii_case(&shared.link_key) {
+                local.key_type = shared.key_type;
+                local.pin_length = shared.pin_length;
+            }
+        }
+        result
+    }
+
     fn needs_update(&self, current: &BluetoothDevice, desired: &BluetoothDevice) -> bool {
         registry_projection(current) != registry_projection(desired)
     }
@@ -658,6 +669,19 @@ mod tests {
         let upper = registry_projection(&lower);
         assert_eq!(registry_projection(&lower), registry_projection(&upper));
     }
+    #[test]
+    fn le_rekey_does_not_downgrade_unchanged_classic_metadata() {
+        let manager = WindowsBluetoothManager::new().unwrap();
+        let mut local = BluetoothDevice::classic("AA:BB:CC:DD:EE:FF".into(), "ab".repeat(16));
+        let mut shared = local.clone();
+        shared.classic.as_mut().unwrap().key_type = 8;
+        shared.classic.as_mut().unwrap().pin_length = 6;
+        let exported = manager.prepare_local_export(&local, &shared);
+        assert_eq!(exported.classic.unwrap().key_type, 8);
+        local.classic.as_mut().unwrap().link_key = "cd".repeat(16);
+        assert_eq!(manager.prepare_local_export(&local, &shared).classic.unwrap().key_type, 4);
+    }
+
     fn key() -> LeLongTermKey {
         LeLongTermKey { key: "11".repeat(16), authenticated: Some(1),
             enc_size: Some(16), ediv: Some(0), rand: Some(0) }

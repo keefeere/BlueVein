@@ -440,7 +440,7 @@ impl SyncManager {
         );
         // Local change wins for represented fields; retain other-platform metadata.
         let device = match config.get_device(adapter_mac, &device.mac_address) {
-            Some(shared) => Self::merge_devices(shared, &device),
+            Some(shared) => Self::merge_devices(shared, &self.bt_manager.prepare_local_export(&device, shared)),
             None => device,
         };
         if config.get_device(adapter_mac, &device.mac_address) == Some(&device) {
