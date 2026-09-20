@@ -175,7 +175,7 @@ pub fn validate_bluetooth_key(key: &str, key_name: &str) -> Result<(), Box<dyn E
 
     // Check if all characters are valid hex
     if !key.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("{} contains non-hexadecimal characters: {}", key_name, key).into());
+        return Err(format!("{} contains non-hexadecimal characters", key_name).into());
     }
 
     // Check length
@@ -193,6 +193,12 @@ pub fn validate_bluetooth_key(key: &str, key_name: &str) -> Result<(), Box<dyn E
 
 /// Trait for platform-specific Bluetooth management
 pub trait BluetoothManager: Send {
+    /// Whether importing the desired record would change fields this backend stores.
+    /// Unsupported cross-platform metadata must stay in EFI, not trigger endless writes.
+    fn needs_update(&self, current: &BluetoothDevice, desired: &BluetoothDevice) -> bool {
+        current != desired
+    }
+
     /// Get list of Bluetooth adapter MAC addresses
     fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>>;
 

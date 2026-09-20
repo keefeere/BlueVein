@@ -195,7 +195,7 @@ impl SyncManager {
                                 // Merge to combine both Classic and LE keys if needed
                                 let merged = Self::merge_devices(system_device, efi_device);
 
-                                if Self::devices_differ(system_device, &merged) {
+                                if self.bt_manager.needs_update(system_device, &merged) {
                                     // Keys differ or missing - update from merged result
                                     log!(
                                         "[BlueVein]   ○ Updating keys for device {} (Classic: {}, LE: {})",
@@ -371,6 +371,17 @@ impl SyncManager {
         Ok(())
     }
 
+    /// Read complete local records, including LE-only devices.
+    pub fn local_snapshot(&self) -> Result<HashMap<(String, String), BluetoothDevice>, Box<dyn Error>> {
+        let mut snapshot = HashMap::new();
+        for adapter in self.bt_manager.get_adapters()? {
+            for device in self.bt_manager.get_devices(&adapter)? {
+                snapshot.insert((adapter.clone(), device.mac_address.clone()), device);
+            }
+        }
+        Ok(snapshot)
+    }
+
     /// Handle a device change event (pairing or key modification)
     ///
     /// Updates the device keys in bluevein.json
@@ -417,7 +428,14 @@ impl SyncManager {
             device.classic.is_some(),
             device.le.is_some()
         );
-        // Update config
+        // Local change wins for represented fields; retain other-platform metadata.
+        let device = match config.get_device(adapter_mac, &device.mac_address) {
+            Some(shared) => Self::merge_devices(shared, &device),
+            None => device,
+        };
+        if config.get_device(adapter_mac, &device.mac_address) == Some(&device) {
+            return Ok(());
+        }
         config.update_device(adapter_mac.to_string(), device.clone());
 
         log!("[BlueVein] Writing updated config to EFI...");
@@ -520,7 +538,7 @@ impl SyncManager {
                     if let Some(system_device) = system_map.get(device_mac) {
                         // Device exists in system - merge and check if keys differ
                         let merged = Self::merge_devices(system_device, efi_device);
-                        if Self::devices_differ(system_device, &merged) {
+                        if self.bt_manager.needs_update(system_device, &merged) {
                             log!(
                                 "[BlueVein] Key mismatch for {} - updating from EFI",
                                 device_mac

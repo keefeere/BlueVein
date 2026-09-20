@@ -435,6 +435,10 @@ impl WindowsBluetoothManager {
 }
 
 impl BluetoothManager for WindowsBluetoothManager {
+    fn needs_update(&self, current: &BluetoothDevice, desired: &BluetoothDevice) -> bool {
+        registry_projection(current) != registry_projection(desired)
+    }
+
     fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>> {
         let mut adapters = Vec::new();
 
@@ -586,5 +590,70 @@ impl BluetoothManager for WindowsBluetoothManager {
         }
 
         Ok(())
+    }
+}
+
+/// The values that survive a Windows registry write/read round trip.
+/// Do not alias peripheral_ltk to ltk: their role semantics are different.
+fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
+    let mut result = device.clone();
+    if let Some(classic) = result.classic.as_mut() {
+        classic.key_type = 4;
+        classic.pin_length = 0;
+    }
+    if let Some(le) = result.le.as_mut() {
+        le.peripheral_ltk = None;
+        le.address_type = None;
+        if let Some(ltk) = le.ltk.as_mut() {
+            ltk.authenticated = Some(ltk.authenticated_or_default());
+        }
+        for csrk in [&mut le.csrk_local, &mut le.csrk_remote].into_iter().flatten() {
+            csrk.counter = 0;
+            csrk.authenticated = false;
+        }
+        if *le == LeKeys::default() {
+            result.le = None;
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> LeLongTermKey {
+        LeLongTermKey { key: "11".repeat(16), authenticated: Some(1),
+            enc_size: Some(16), ediv: Some(0), rand: Some(0) }
+    }
+
+    #[test]
+    fn iphone_irk_only_does_not_reimport_linux_metadata() {
+        let current = BluetoothDevice { mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            classic: None, le: Some(LeKeys { irk: Some("22".repeat(16)), ..Default::default() }) };
+        let mut desired = current.clone();
+        desired.le.as_mut().unwrap().peripheral_ltk = Some(key());
+        desired.le.as_mut().unwrap().address_type = Some("public".into());
+        assert_eq!(registry_projection(&current), registry_projection(&desired));
+        assert!(desired.le.as_ref().unwrap().peripheral_ltk.is_some());
+    }
+
+    #[test]
+    fn real_ltk_and_irk_changes_still_require_import() {
+        let current = BluetoothDevice::le_with_ltk("AA:BB:CC:DD:EE:FF".into(), key());
+        let mut desired = current.clone();
+        desired.le.as_mut().unwrap().ltk.as_mut().unwrap().key = "33".repeat(16);
+        assert_ne!(registry_projection(&current), registry_projection(&desired));
+        let mut desired = current.clone();
+        desired.le.as_mut().unwrap().irk = Some("22".repeat(16));
+        assert_ne!(registry_projection(&current), registry_projection(&desired));
+    }
+
+    #[test]
+    fn peripheral_key_alone_is_not_a_windows_ltk() {
+        let mut device = BluetoothDevice::le_with_ltk("AA:BB:CC:DD:EE:FF".into(), key());
+        let le = device.le.as_mut().unwrap();
+        le.peripheral_ltk = le.ltk.take();
+        assert!(registry_projection(&device).le.is_none());
     }
 }
