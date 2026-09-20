@@ -16,6 +16,23 @@ pub struct LeLongTermKey {
 }
 
 impl LeLongTermKey {
+    /// Missing metadata from another backend is not a request to downgrade the
+    /// same key. Never carry security metadata across different key material.
+    fn merge_optional(existing: &Option<Self>, preferred: &Option<Self>) -> Option<Self> {
+        match (existing, preferred) {
+            (Some(a), Some(b)) if a.key.eq_ignore_ascii_case(&b.key) => Some(Self {
+                key: b.key.clone(),
+                authenticated: b.authenticated.or(a.authenticated),
+                enc_size: b.enc_size.or(a.enc_size),
+                ediv: b.ediv.or(a.ediv),
+                rand: b.rand.or(a.rand),
+            }),
+            (_, Some(b)) => Some(b.clone()),
+            (Some(a), None) => Some(a.clone()),
+            (None, None) => None,
+        }
+    }
+
     /// Get authenticated value, defaulting to 0 if not set
     pub fn authenticated_or_default(&self) -> u8 {
         self.authenticated.unwrap_or(0)
@@ -141,11 +158,8 @@ impl BluetoothDevice {
     /// Merge LE keys from two sources, preferring non-None values from other
     fn merge_le_keys(le1: &LeKeys, le2: &LeKeys) -> LeKeys {
         LeKeys {
-            ltk: le2.ltk.clone().or_else(|| le1.ltk.clone()),
-            peripheral_ltk: le2
-                .peripheral_ltk
-                .clone()
-                .or_else(|| le1.peripheral_ltk.clone()),
+            ltk: LeLongTermKey::merge_optional(&le1.ltk, &le2.ltk),
+            peripheral_ltk: LeLongTermKey::merge_optional(&le1.peripheral_ltk, &le2.peripheral_ltk),
             irk: le2.irk.clone().or_else(|| le1.irk.clone()),
             csrk_local: le2.csrk_local.clone().or_else(|| le1.csrk_local.clone()),
             csrk_remote: le2.csrk_remote.clone().or_else(|| le1.csrk_remote.clone()),
@@ -274,6 +288,15 @@ pub fn is_valid_mac_hex(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_key_retains_sc_metadata_missing_from_older_exports() {
+        let known = LeLongTermKey { key: "AB".repeat(16), authenticated: Some(2), enc_size: Some(16), ediv: Some(0), rand: Some(0) };
+        let mut sparse = known.clone(); sparse.key.make_ascii_lowercase(); sparse.authenticated = None;
+        assert_eq!(LeLongTermKey::merge_optional(&Some(known.clone()), &Some(sparse.clone())).unwrap().authenticated, Some(2));
+        sparse.key = "CD".repeat(16);
+        assert_eq!(LeLongTermKey::merge_optional(&Some(known), &Some(sparse)).unwrap().authenticated, None);
+    }
 
     #[test]
     fn test_normalize_mac() {

@@ -121,6 +121,14 @@ impl SyncManager {
     ///      * If it's NOT in EFI → ADD to EFI (new pairing on this OS)
     /// 4. Write updated bluevein.json back to EFI
     pub fn sync_bidirectional(&mut self) -> Result<(), Box<dyn Error>> {
+        self.sync_bidirectional_mode(true)
+    }
+
+    pub fn preview_bidirectional(&mut self) -> Result<(), Box<dyn Error>> {
+        self.sync_bidirectional_mode(false)
+    }
+
+    fn sync_bidirectional_mode(&mut self, apply: bool) -> Result<(), Box<dyn Error>> {
         log!(
             "[BlueVein] Starting bidirectional synchronization (EFI device: {})...",
             self.store.display_name()
@@ -205,6 +213,10 @@ impl SyncManager {
                                         merged.classic.is_some(),
                                         merged.le.is_some()
                                     );
+                                    if !apply {
+                                        log!("[BlueVein] AUDIT would update local keys for {}", device_mac);
+                                        continue;
+                                    }
                                     match self.bt_manager.set_device(adapter_mac, &merged) {
                                         Ok(_) => {
                                             log!("[BlueVein]   ✓ Updated device {}", device_mac)
@@ -269,6 +281,10 @@ impl SyncManager {
 
         if original_config.as_ref() == Some(&final_config) {
             log!("[BlueVein] Shared config unchanged; skipping EFI write");
+            return Ok(());
+        }
+        if !apply {
+            log!("[BlueVein] AUDIT would update shared EFI config; no key writes performed");
             return Ok(());
         }
         // Write merged config back to EFI
@@ -617,6 +633,18 @@ mod tests {
         state.shared.update_device("adapter".into(), shared);
         let state = Arc::new(Mutex::new(state));
         (SyncManager { bt_manager: Box::new(Backend(state.clone())), store: Box::new(Store(state.clone())) }, state)
+    }
+
+    #[test]
+    fn preview_uses_import_plan_without_writing_local_or_shared_keys() {
+        let (mut sync, state) = setup(device("11"), device("22"));
+        let before = state.lock().unwrap().shared.clone();
+        sync.preview_bidirectional().unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.local.get("phone"), Some(&device("11")));
+        assert_eq!(state.shared, before);
+        assert_eq!(state.local_writes, 0);
+        assert_eq!(state.shared_writes, 0);
     }
 
     #[test]

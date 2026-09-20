@@ -365,6 +365,12 @@ impl WindowsBluetoothManager {
         device_mac: &str,
         le: &LeKeys,
     ) -> Result<(), Box<dyn Error>> {
+        if let Some(ltk) = &le.ltk {
+            validate_bluetooth_key(&ltk.key, "LTK")?;
+            if ltk.authenticated_or_default() > 3 {
+                return Err("Unsupported LTK security type for Windows".into());
+            }
+        }
         // Ensure base LE registry path exists (create if needed)
         let bt_le_keys = self.ensure_bluetooth_le_keys()?;
 
@@ -577,6 +583,13 @@ impl BluetoothManager for WindowsBluetoothManager {
                 local.pin_length = shared.pin_length;
             }
         }
+        if let (Some(local), Some(shared)) = (&mut result.le, &shared.le) {
+            if let Some(ltk) = local.ltk.as_ref() {
+                if matches!(ltk.authenticated, Some(2) | Some(3)) && shared.peripheral_ltk.is_some() {
+                    local.peripheral_ltk = Some(ltk.clone());
+                }
+            }
+        }
         result
     }
 
@@ -709,7 +722,7 @@ fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
             csrk.counter = 0;
             csrk.authenticated = false;
         }
-        if *le == LeKeys::default() {
+        if le.ltk.is_none() && le.irk.is_none() && le.csrk_local.is_none() && le.csrk_remote.is_none() {
             result.le = None;
         }
     }

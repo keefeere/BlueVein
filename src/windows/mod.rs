@@ -21,6 +21,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         if args.len() > 1 {
             match args[1].as_str() {
+                "audit-sync" | "sync-once" => {
+                    let manager = Box::new(bluetooth::WindowsBluetoothManager::new()?);
+                    let context = EfiContext::from_env();
+                    let mut sync = SyncManager::new(manager, context);
+                    if args[1] == "audit-sync" { sync.preview_bidirectional() } else { sync.sync_bidirectional() }
+                },
                 "install" => service::install_service(),
                 "uninstall" => service::uninstall_service(),
                 "start" => service::start_service(),
@@ -28,6 +34,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 _ => {
                     log!("BlueVein - Bluetooth Synchronization Service");
                     log!("\nUsage:");
+                    log!("  bluevein.exe audit-sync - Preview synchronization without changing keys");
+                    log!("  bluevein.exe sync-once  - Synchronize once, then exit");
                     log!("  bluevein.exe install   - Install service");
                     log!("  bluevein.exe uninstall - Uninstall service");
                     log!("  bluevein.exe start     - Start service");
