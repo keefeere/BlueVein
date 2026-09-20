@@ -1,49 +1,80 @@
-# Windows LE synchronization repair
+# Windows LE identity synchronization repair
 
-This branch fixes confirmed data flow defects in BlueVein 1.2.0. It does not
-claim that an existing, rejected iPhone bond has been recovered.
+## Root cause verified on a dual-boot host
 
-## Confirmed defects
+Windows stored the working HID bond under a pairing-time resolvable private
+address. Its registry `Address` value identified the public peer identity used by
+Linux. BlueVein 1.2.0 indexed the shared record by the registry subkey name and
+ignored `Address` and `AddressType`. Correct Windows LTK/IRK values reached EFI,
+but under the temporary address, while the Linux identity record retained an old
+LTK and a different IRK.
 
-- The Windows notification handler watched the whole registry subtree but its
-  snapshot contained only Classic adapter values. LE-only pairing/rekey events
-  therefore did not export the new LE keys.
-- The EFI importer compared the full cross-platform record with a lossy Windows
-  representation. Linux-only peripheral LTK/address metadata, Classic metadata,
-  and CSRK counters caused repeated writes even when Windows-storable keys agreed.
-- A separate periodic importer could race the Windows export handler.
-- Startup merged local-only fields into the system record but did not persist
-  them back to an existing EFI device. Local change exports replaced the shared
-  record and could erase fields the current backend cannot read.
+A separate public-address Windows entry contained only the stale IRK. The fix
+prefers the complete identity-mapped bond, refuses conflicting complete bonds,
+and routes imports back to the real Windows storage entry.
 
-## Changes and regression evidence
+## Repair and invariants
 
-Windows now polls complete Classic/LE records once a second and serializes exports
-before the periodic import. This reads the registry; it does not scan Bluetooth,
-restart the radio, or add a service. Failed exports defer imports and remain pending.
+- Export/import uses the peer identity and its public/static-random address type.
+- Legacy EFI aliases migrate only when their LTK, IRK, EDIV, Rand and key length
+  match the live Windows bond. Mismatches stop automatic migration.
+- Classic keys and other devices are retained. A stale peripheral LTK is replaced
+  by the current SC key only for a verified Secure Connections bond; unresolved
+  legacy role-specific conflicts stop migration.
+- Windows AuthReq SC metadata and zero EDIV/Rand map to the BlueZ MGMT P-256 key
+  type. Requested MITM alone is not treated as proof of authentication. Windows
+  writes use its boolean Authenticated representation and preserve other flags.
+- Missing metadata in older exports does not downgrade the same known LTK.
+- Complete Classic/LE snapshots serialize local exports before periodic imports.
+- Platform-only metadata does not cause endless import loops; unchanged state
+  does not rewrite EFI. Read/import errors stop synchronization.
+- Windows service status interrogation no longer requests shutdown.
 
-Import comparisons use the Windows write/read representation. Unsupported fields
-remain in EFI. `peripheral_ltk` is deliberately not relabeled as `ltk`: BlueZ
-stores different role information, and an old rejected key is not repaired by
-renaming its section.
+The Linux key type/role behavior is documented by BlueZ MGMT and Linux
+`hci_find_ltk`: Secure Connections keys apply independently of central/peripheral
+role. Legacy role-specific keys are not interchangeable.
 
-Existing-device merges are exported at startup, local changes retain shared-only
-fields, and unchanged records do not rewrite EFI. Validation errors do not print
-key material.
+## Commands
 
-Tests cover an IRK-only Windows record with a shared peripheral LTK, actual LTK/IRK
-changes, LE-only rekey detection, local-export/import convergence, startup export
-of missing fields, preservation of unrelated devices, and an actual Windows
-registry round trip in an isolated HKCU fixture. CI builds Windows and Linux.
+`bluevein.exe audit-sync [adapter-mac identity-mac]` runs the same planning code
+without modifying the registry or EFI keys. Its diagnostics do not print secrets.
 
-## Remaining validation
+`bluevein.exe repair-efi-only [adapter-mac identity-mac]` writes the shared config
+but refuses any plan that would update local Windows keys. Scope the first repair
+to the affected peer; take a private backup and stop the old sync service first.
 
-- Startup still follows upstream's EFI preference for conflicting non-null values;
-  without a persisted last-synced baseline it cannot prove which offline change is
-  newer. Do not claim general offline conflict resolution.
-- The user's live iPhone record has no LTK in the inspected standard registry path.
-  Recover the actual Windows bond source before changing keys or role mappings.
-- Do not deploy over an active installation before taking private, scoped backups
-  and reviewing the exact mutation. CI does not prove physical reconnection.
-- Verify Windows and Linux boots with the same adapter, successful encryption and
-  HID subscription, and preservation of other paired devices.
+`bluevein.exe sync-once [adapter-mac identity-mac]` performs one synchronization.
+Normal service operation remains automatic for all devices.
+
+## Validation and limits
+
+CI exercises real registry round trips in isolated HKCU fixtures, identity/RPA
+migration with a stale IRK-only shadow, conflict rejection, SC metadata, LE rekey
+handling, unchanged-state behavior, failure handling, and service control. It
+builds both Windows and Linux.
+
+A live read-only audit verified that the affected peer's migration requires no
+Windows key writes. Deployment additionally checks key equality, unchanged other
+EFI records, unchanged Windows registry values, and the actual service process.
+
+Physical Linux reconnect and subsequent Windows return must still be tested.
+Startup retains upstream EFI precedence for unrelated conflicting offline edits;
+there is no persisted three-way conflict history. This branch must not be described
+as resolving arbitrary simultaneous offline pairing changes.
+
+## Deployed Windows validation (2026-09-20)
+
+Commit `4b28aa3` passed 40 Windows tests and 27 Linux tests, with release builds
+for both platforms. Its Windows binary was installed as the existing service
+using a protected ProgramData directory.
+
+The scoped repair verified current registry LTK/IRK equality at the canonical EFI
+identity, removal of the legacy alias, preservation of all other EFI records at
+the repair checkpoint, and byte-for-byte preservation of Windows registry values
+before and after starting the replacement service. Private pre-change backups
+are DPAPI-protected with restricted ACLs. Bluetooth radio/service was not restarted.
+
+The replacement service remained running across multiple periodic checks without
+new key-mismatch or error messages. Physical Linux reconnect and return-to-Windows
+validation remain outstanding; these results are not a claim of completed hardware
+validation.
