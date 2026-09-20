@@ -70,7 +70,25 @@ Headphones don't work again → **Pair again**
 
 Pair your device **once** in any OS. \
 Switch between Windows and Linux. \
-**Everything works automatically**. Forever.
+BlueVein keeps the pairing keys synchronized automatically. Reconnection still
+depends on the Bluetooth stack in each OS; a valid bond alone cannot repair a
+host-side connection bug.
+
+When Windows has a cached Bluetooth device name, BlueVein also carries it in
+the shared record. Linux uses it as the BlueZ `Name` while importing or updating
+the matching bond; an existing Linux `Alias` is preserved. Names are optional:
+older shared files and devices without a cached name remain valid.
+
+When a running BlueVein instance has already observed and synchronized a local
+bond, then sees that bond removed, it writes a pending-deletion marker to EFI.
+On the next boot of the other OS, BlueVein unpairs that device only if its
+bonding key fingerprints match the removed bond, then removes the shared EFI
+record. A newly paired device at the same address is kept and replaces the old
+marker. A device missing on the first snapshot after boot does **not** imply
+deletion: older bonds from the other OS can still be imported. Failed or
+ambiguous unpair operations leave the marker in EFI for diagnosis. Install a
+version with this behavior on **both** operating systems before using deletion
+as a cross-OS cleanup mechanism.
 
 ## 🌟 Why BlueVein?
 
@@ -80,7 +98,7 @@ Switch between Windows and Linux. \
 |:---:|:---|
 | 🔄 **Bidirectional sync** | Changes in any OS are instantly synchronized |
 | 🚀 **Zero configuration** | Install → Run → Forget about the problem |
-| 💾 **Direct EFI access** | No partition mounting via [fat32-raw](https://github.com/meowrch/fat32-raw) |
+| 💾 **EFI access** | Uses the mounted EFI filesystem on Linux when available; otherwise [fat32-raw](https://github.com/meowrch/fat32-raw) |
 | 🛡️ **Security** | Works at system level with administrator privileges |
 | 📡 **Real-time monitoring** | Tracks changes instantly |
 | 🔍 **Periodic checking** | Checks for updates from the other OS every 30 seconds |
@@ -364,9 +382,10 @@ BlueVein uses **`EfiContext`** to manage EFI partition access:
 
 - **Automatic detection:** By default, BlueVein automatically finds the EFI partition at standard mount points (`/boot/efi`, `/efi`, `/boot` on Linux)
 - **Manual specification:** Use the `BLUEVEIN_EFI_DEVICE` environment variable to explicitly specify a device
-- **Two-level access:**
-  1. First checks mounted EFI partition (faster, no cache issues)
-  2. If not found — uses direct access via `fat32-raw`
+- **Linux access:** Even with `BLUEVEIN_EFI_DEVICE` set, BlueVein reads and atomically writes through the mounted EFI filesystem when that device is mounted. It synchronizes the filesystem after a write so a subsequent raw read sees the same FAT chain. Raw access is used only when the selected EFI device is unmounted.
+- **Windows access:** Uses direct access via `fat32-raw`.
+
+Do not write to a mounted FAT filesystem through its block device. The kernel can retain cached FAT metadata and later overwrite or misinterpret the raw changes.
 
 **Benefits of this approach:**
 - Flexibility in complex configurations (multiple EFI partitions, RAID, LVM)
@@ -434,6 +453,7 @@ BlueVein is **fully automatic** and works in real-time as a background service.
 | ❌ **Service won't start (Linux)** | Run `sudo systemctl status bluevein` and check logs: `sudo journalctl -u bluevein -n 50` |
 | ❌ **Service won't start (Windows)** | Make sure PowerShell is running **as Administrator** |
 | ❌ **Device still won't sync** | Check that EFI partition is mounted: `lsblk -f \| grep vfat` (Linux) or verify the service is running |
+| ❌ **Keys match, but Linux does not reconnect** | Check the LE/Classic connection and HID profile separately. BlueVein synchronizes bonds; it does not scan for or connect devices. BlueZ 5.87 has a [dual-mode private-address reconnect issue](https://github.com/bluez/bluez/issues/2356) that needs a separate host workaround. |
 | ❌ **Permission denied** | BlueVein requires root/admin. On Linux use `sudo systemctl` or run the service as root |
 
 > [!TIP]
