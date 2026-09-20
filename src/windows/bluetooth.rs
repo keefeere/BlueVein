@@ -622,6 +622,29 @@ fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
 mod tests {
     use super::*;
 
+    #[test]
+    fn windows_registry_round_trip_converges_without_touching_system_bonds() {
+        // Isolated HKCU fixture. The normal SYSTEM path is nested below this key.
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let root = format!("Software\\BlueVeinTests\\roundtrip-{}", std::process::id());
+        let (fixture, _) = hkcu.create_subkey(&root).unwrap();
+        let mut manager = WindowsBluetoothManager { hklm: fixture };
+        let adapter = "00:11:22:33:44:55";
+        let mut desired = BluetoothDevice::le_with_ltk("AA:BB:CC:DD:EE:FF".into(), key());
+        let le = desired.le.as_mut().unwrap();
+        le.irk = Some("22".repeat(16));
+        le.peripheral_ltk = Some(key());
+        le.address_type = Some("public".into());
+        le.csrk_local = Some(CsrkKey { key: "33".repeat(16), counter: 100, authenticated: true });
+        manager.set_device(adapter, &desired).unwrap();
+        let actual = manager.get_device(adapter, &desired.mac_address).unwrap();
+        assert!(!manager.needs_update(&actual, &desired));
+        assert_eq!(actual.le.as_ref().unwrap().ltk, desired.le.as_ref().unwrap().ltk);
+        assert!(actual.le.as_ref().unwrap().peripheral_ltk.is_none());
+        assert_eq!(manager.get_devices(adapter).unwrap().len(), 1);
+        drop(manager);
+        hkcu.delete_subkey_all(&root).unwrap();
+    }
     fn key() -> LeLongTermKey {
         LeLongTermKey { key: "11".repeat(16), authenticated: Some(1),
             enc_size: Some(16), ediv: Some(0), rand: Some(0) }
