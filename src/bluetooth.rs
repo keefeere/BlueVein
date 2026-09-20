@@ -204,6 +204,11 @@ pub trait BluetoothManager: Send {
         local.clone()
     }
 
+    /// Repair legacy shared-address indexing using verified platform identity metadata.
+    fn migrate_shared_config(&self, _config: &mut crate::config::BlueVeinConfig) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
     /// Get list of Bluetooth adapter MAC addresses
     fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>>;
 

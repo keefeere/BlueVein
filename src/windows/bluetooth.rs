@@ -66,6 +66,66 @@ impl WindowsBluetoothManager {
         }
     }
 
+    /// Windows can index an LE bond by its pairing-time RPA. Address/AddressType
+    /// identify the peer that BlueZ must load the keys for, not the registry name.
+    fn le_locations(adapter: &RegKey) -> Result<Vec<(String, String, Option<String>)>, Box<dyn Error>> {
+        let mut locations = Vec::new();
+        for name in adapter.enum_keys() {
+            let name = name?;
+            if !is_valid_mac_hex(&name) { continue; }
+            let record = adapter.open_subkey_with_flags(&name, KEY_READ)?;
+            let address = match record.get_value::<u64, _>("Address") {
+                Ok(value) => Some(value),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            };
+            let address_type = match record.get_value::<u32, _>("AddressType") {
+                Ok(0) => Some("public".to_string()),
+                Ok(1) => Some("random".to_string()),
+                Ok(_) => return Err("Unsupported Windows LE identity address type".into()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            };
+            let identity = if let Some(address) = address {
+                if address == 0 || address > 0xffffffffffff {
+                    return Err("Invalid Windows LE identity address".into());
+                }
+                if address_type.as_deref() == Some("random") && (address >> 40) & 0xc0 != 0xc0 {
+                    return Err("Windows LE identity is a temporary random address".into());
+                }
+                windows_format_to_mac(&format!("{:012X}", address))
+            } else {
+                windows_format_to_mac(&name)
+            };
+            locations.push((name, identity, address_type));
+        }
+        Ok(locations)
+    }
+
+    fn le_storage_name(adapter: &RegKey, identity: &str) -> Result<Option<String>, Box<dyn Error>> {
+        let identity = normalize_mac(identity);
+        let mut candidates = Vec::new();
+        for (name, peer, _) in Self::le_locations(adapter)? {
+            if peer == identity {
+                let record = adapter.open_subkey_with_flags(&name, KEY_READ)?;
+                let ltk = record.get_raw_value("LTK").ok().map(|v| v.bytes);
+                let irk = record.get_raw_value("IRK").ok().map(|v| v.bytes);
+                candidates.push((name, ltk, irk));
+            }
+        }
+        // Prefer a complete LE bond over a stale IRK-only record at the public MAC.
+        if candidates.iter().any(|(_, ltk, _)| ltk.is_some()) {
+            candidates.retain(|(_, ltk, _)| ltk.is_some());
+        }
+        if let Some(first) = candidates.first() {
+            if candidates.iter().any(|other| other.1 != first.1 || other.2 != first.2) {
+                return Err("Conflicting Windows LE records for one identity; refusing to choose a bond".into());
+            }
+        }
+        candidates.sort_by_key(|entry| entry.0.to_ascii_uppercase());
+        Ok(candidates.into_iter().next().map(|entry| entry.0))
+    }
+
     /// Read classic Bluetooth device keys
     fn read_classic_device(
         &self,
@@ -112,7 +172,6 @@ impl WindowsBluetoothManager {
         let bt_le_keys = self.open_bluetooth_le_keys()?;
 
         let adapter_key_name = mac_to_windows_format(adapter_mac);
-        let device_key_name = mac_to_windows_format(device_mac);
 
         let adapter_key = match bt_le_keys.open_subkey_with_flags(&adapter_key_name, KEY_READ) {
             Ok(key) => key,
@@ -120,6 +179,10 @@ impl WindowsBluetoothManager {
             Err(e) => return Err(e.into()),
         };
 
+        let device_key_name = match Self::le_storage_name(&adapter_key, device_mac)? {
+            Some(name) => name,
+            None => return Ok(None),
+        };
         let device_key = match adapter_key.open_subkey_with_flags(&device_key_name, KEY_READ) {
             Ok(key) => key,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -128,6 +191,9 @@ impl WindowsBluetoothManager {
 
         let mut le_keys = LeKeys::default();
         let mut has_keys = false;
+        le_keys.address_type = Self::le_locations(&adapter_key)?.into_iter()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(&device_key_name))
+            .and_then(|(_, _, address_type)| address_type);
 
         // Read LTK (Long Term Key)
         if let Ok(ltk_value) = device_key.get_raw_value("LTK") {
@@ -155,6 +221,10 @@ impl WindowsBluetoothManager {
                     .map(|v| v as u16);
                 let rand = device_key.get_value::<u64, _>("ERand").ok();
 
+                // BlueZ stores the MGMT key type in Authenticated: 0/1 legacy,
+                // 2/3 Secure Connections. Windows uses a separate AuthReq SC bit.
+                let authenticated = Some(windows_ltk_type(authenticated,
+                    device_key.get_value::<u32, _>("AuthReq").ok(), ediv, rand));
                 le_keys.ltk = Some(LeLongTermKey {
                     key,
                     authenticated,
@@ -299,7 +369,6 @@ impl WindowsBluetoothManager {
         let bt_le_keys = self.ensure_bluetooth_le_keys()?;
 
         let adapter_key_name = mac_to_windows_format(adapter_mac);
-        let device_key_name = mac_to_windows_format(device_mac);
 
         // Create adapter key if it doesn't exist
         let (adapter_key, adapter_disp) =
@@ -317,6 +386,8 @@ impl WindowsBluetoothManager {
             );
         }
 
+        let device_key_name = Self::le_storage_name(&adapter_key, device_mac)?
+            .unwrap_or_else(|| mac_to_windows_format(device_mac));
         // Create device key - this is where LE keys are stored
         let (device_key, device_disp) =
             adapter_key.create_subkey(&device_key_name).map_err(|e| {
@@ -338,6 +409,16 @@ impl WindowsBluetoothManager {
             );
         }
 
+        if let Some(address_type) = &le.address_type {
+            let value = match address_type.as_str() {
+                "public" => 0u32,
+                "random" => 1u32,
+                _ => return Err("Unsupported LE address type".into()),
+            };
+            let address = u64::from_str_radix(&mac_to_windows_format(device_mac), 16)?;
+            device_key.set_value("Address", &address)?;
+            device_key.set_value("AddressType", &value)?;
+        }
         // Write LTK
         if let Some(ltk) = &le.ltk {
             // Validate LTK before writing
@@ -355,7 +436,13 @@ impl WindowsBluetoothManager {
             )?;
 
             // Use authenticated_or_default() to ensure default value of 0
-            device_key.set_value("Authenticated", &(ltk.authenticated_or_default() as u32))?;
+            let key_type = ltk.authenticated_or_default();
+            if key_type > 3 { return Err("Unsupported LTK security type for Windows".into()); }
+            device_key.set_value("Authenticated", &((key_type & 1) as u32))?;
+            let auth_req = device_key.get_value::<u32, _>("AuthReq").unwrap_or(1);
+            let auth_req = (auth_req & !0x0c) | if key_type & 2 != 0 { 0x08 } else { 0 }
+                | if key_type & 1 != 0 { 0x04 } else { 0 };
+            device_key.set_value("AuthReq", &auth_req)?;
 
             if let Some(enc_size) = ltk.enc_size {
                 device_key.set_value("KeyLength", &(enc_size as u32))?;
@@ -432,6 +519,56 @@ impl WindowsBluetoothManager {
 }
 
 impl BluetoothManager for WindowsBluetoothManager {
+    fn migrate_shared_config(&self, config: &mut crate::config::BlueVeinConfig) -> Result<(), Box<dyn Error>> {
+        for adapter_mac in self.get_adapters()? {
+            let keys = self.open_bluetooth_keys()?;
+            let adapter = keys.open_subkey_with_flags(mac_to_windows_format(&adapter_mac), KEY_READ)?;
+            for (storage, identity, _) in Self::le_locations(&adapter)? {
+                let alias = windows_format_to_mac(&storage);
+                if alias == identity { continue; }
+                let Some(old_alias) = config.get_device(&adapter_mac, &alias).cloned() else { continue; };
+                let current = self.get_device(&adapter_mac, &identity)?;
+                let live_le = current.le.as_ref().ok_or("Missing live LE bond during identity migration")?;
+                let old_le = old_alias.le.as_ref().ok_or("Legacy alias has no LE bond")?;
+                let same_ltk = match (&old_le.ltk, &live_le.ltk) {
+                    (Some(a), Some(b)) => a.key.eq_ignore_ascii_case(&b.key)
+                        && a.ediv == b.ediv && a.rand == b.rand && a.enc_size == b.enc_size,
+                    _ => false,
+                };
+                let same_irk = match (&old_le.irk, &live_le.irk) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                    _ => false,
+                };
+                if !same_ltk || !same_irk {
+                    return Err("Legacy EFI alias differs from the live Windows bond; refusing automatic migration".into());
+                }
+                let mut canonical = config.get_device(&adapter_mac, &identity).cloned()
+                    .unwrap_or_else(|| current.clone());
+                let previous_peripheral = canonical.le.as_ref().and_then(|le| le.peripheral_ltk.as_ref());
+                let mut new_le = live_le.clone();
+                if let Some(old_peripheral) = previous_peripheral {
+                    let ltk = live_le.ltk.as_ref().ok_or("Missing LTK")?;
+                    if matches!(ltk.authenticated, Some(2) | Some(3)) {
+                        // SC has one key for both roles; replace the stale old SC/legacy key.
+                        // Keeping it would let Linux continue selecting a rejected bond.
+                        new_le.peripheral_ltk = Some(ltk.clone());
+                    } else if old_peripheral.key.eq_ignore_ascii_case(&ltk.key) {
+                        new_le.peripheral_ltk = Some(old_peripheral.clone());
+                    } else {
+                        return Err("Legacy role-specific LTK conflict requires explicit resolution".into());
+                    }
+                }
+                canonical.mac_address = identity.clone();
+                canonical.le = Some(new_le);
+                if canonical.classic.is_none() { canonical.classic = current.classic; }
+                config.update_device(adapter_mac.clone(), canonical);
+                config.adapters.get_mut(&adapter_mac).unwrap().devices.remove(&alias);
+                log!("[BlueVein] Migrated verified LE alias {} to identity {}", alias, identity);
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_local_export(&self, local: &BluetoothDevice, shared: &BluetoothDevice) -> BluetoothDevice {
         let mut result = local.clone();
         if let (Some(local), Some(shared)) = (&mut result.classic, &shared.classic) {
@@ -469,9 +606,8 @@ impl BluetoothManager for WindowsBluetoothManager {
             let (name, _) = value?;
             if is_valid_mac_hex(&name) { names.insert(windows_format_to_mac(&name)); }
         }
-        for name in adapter.enum_keys() {
-            let name = name?;
-            if is_valid_mac_hex(&name) { names.insert(windows_format_to_mac(&name)); }
+        for (_, identity, _) in Self::le_locations(&adapter)? {
+            names.insert(identity);
         }
         let mut devices = Vec::new();
         for mac in names {
@@ -544,6 +680,14 @@ impl BluetoothManager for WindowsBluetoothManager {
     }
 }
 
+fn windows_ltk_type(authenticated: Option<u8>, auth_req: Option<u32>, ediv: Option<u16>, rand: Option<u64>) -> u8 {
+    let authenticated = authenticated.unwrap_or(0);
+    let secure = auth_req.map(|flags| flags & 0x08 != 0).unwrap_or(false)
+        && ediv == Some(0) && rand == Some(0);
+    // Do not treat requested MITM in AuthReq as proof of authenticated pairing.
+    (authenticated & 1) | if secure || authenticated & 2 != 0 { 2 } else { 0 }
+}
+
 /// The values that survive a Windows registry write/read round trip.
 /// Do not alias peripheral_ltk to ltk: their role semantics are different.
 fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
@@ -556,7 +700,6 @@ fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
     if let Some(le) = result.le.as_mut() {
         if let Some(irk) = le.irk.as_mut() { irk.make_ascii_uppercase(); }
         le.peripheral_ltk = None;
-        le.address_type = None;
         if let Some(ltk) = le.ltk.as_mut() {
             ltk.key.make_ascii_uppercase();
             ltk.authenticated = Some(ltk.authenticated_or_default());
@@ -622,6 +765,98 @@ mod tests {
         assert_eq!(manager.prepare_local_export(&local, &shared).classic.unwrap().key_type, 4);
     }
 
+
+    fn identity_fixture(label: &str) -> (RegKey, String, WindowsBluetoothManager) {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let root = format!("Software\\BlueVeinTests\\{}-{}", label, std::process::id());
+        let (fixture, _) = hkcu.create_subkey(&root).unwrap();
+        let mut manager = WindowsBluetoothManager { hklm: fixture };
+        let mut live = BluetoothDevice::le_with_ltk("41:22:33:44:55:66".into(), key());
+        live.le.as_mut().unwrap().irk = Some("22".repeat(16));
+        manager.set_device("00:11:22:33:44:55", &live).unwrap();
+        let keys = manager.open_bluetooth_keys().unwrap();
+        let adapter = keys.open_subkey_with_flags("001122334455", KEY_ALL_ACCESS).unwrap();
+        let alias = adapter.open_subkey_with_flags("412233445566", KEY_ALL_ACCESS).unwrap();
+        alias.set_value("Address", &0x123456789abcu64).unwrap();
+        alias.set_value("AddressType", &0u32).unwrap();
+        alias.set_value("AuthReq", &0x2du32).unwrap();
+        alias.delete_value("Authenticated").unwrap();
+        let (shadow, _) = adapter.create_subkey("123456789abc").unwrap();
+        shadow.set_raw_value("IRK", &winreg::RegValue { bytes: vec![0x99; 16], vtype: RegType::REG_BINARY }).unwrap();
+        (hkcu, root, manager)
+    }
+
+    #[test]
+    fn rpa_registry_record_exports_under_identity_and_imports_to_same_storage() {
+        let (hkcu, root, mut manager) = identity_fixture("identity-roundtrip");
+        let mut devices = manager.get_devices("00:11:22:33:44:55").unwrap();
+        assert_eq!(devices.len(), 1);
+        let mut device = devices.pop().unwrap();
+        assert_eq!(device.mac_address, "12:34:56:78:9A:BC");
+        assert_eq!(device.le.as_ref().unwrap().address_type.as_deref(), Some("public"));
+        assert_eq!(device.le.as_ref().unwrap().ltk.as_ref().unwrap().authenticated, Some(2));
+        assert_eq!(device.le.as_ref().unwrap().irk.as_deref(), Some("22222222222222222222222222222222"));
+        device.le.as_mut().unwrap().ltk.as_mut().unwrap().key = "33".repeat(16);
+        manager.set_device("00:11:22:33:44:55", &device).unwrap();
+        assert!(!manager.needs_update(&manager.get_device("00:11:22:33:44:55", &device.mac_address).unwrap(), &device));
+        let keys = manager.open_bluetooth_keys().unwrap();
+        let adapter = keys.open_subkey("001122334455").unwrap();
+        assert_eq!(adapter.open_subkey("412233445566").unwrap().get_raw_value("LTK").unwrap().bytes, vec![0x33; 16]);
+        assert!(adapter.open_subkey("123456789abc").unwrap().get_raw_value("LTK").is_err());
+        drop(manager);
+        hkcu.delete_subkey_all(&root).unwrap();
+    }
+
+    #[test]
+    fn migration_moves_verified_alias_keys_and_replaces_stale_sc_role_key() {
+        let (hkcu, root, manager) = identity_fixture("identity-migration");
+        let mut config = crate::config::BlueVeinConfig::new();
+        let mut alias = BluetoothDevice::le_with_ltk("41:22:33:44:55:66".into(), key());
+        alias.le.as_mut().unwrap().irk = Some("22".repeat(16));
+        config.update_device("00:11:22:33:44:55".into(), alias);
+        let mut old = BluetoothDevice::classic("12:34:56:78:9A:BC".into(), "44".repeat(16));
+        let mut old_key = key(); old_key.key = "99".repeat(16); old_key.authenticated = Some(2);
+        old.le = Some(LeKeys { peripheral_ltk: Some(old_key), irk: Some("99".repeat(16)), ..Default::default() });
+        config.update_device("00:11:22:33:44:55".into(), old);
+        let other = BluetoothDevice::classic("AA:BB:CC:DD:EE:FF".into(), "55".repeat(16));
+        config.update_device("00:11:22:33:44:55".into(), other.clone());
+        manager.migrate_shared_config(&mut config).unwrap();
+        assert!(config.get_device("00:11:22:33:44:55", "41:22:33:44:55:66").is_none());
+        let result = config.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap();
+        let le = result.le.as_ref().unwrap();
+        assert_eq!(le.ltk, le.peripheral_ltk);
+        assert_eq!(le.ltk.as_ref().unwrap().authenticated, Some(2));
+        assert_eq!(result.classic.as_ref().unwrap().link_key, "44".repeat(16));
+        assert_eq!(config.get_device("00:11:22:33:44:55", &other.mac_address), Some(&other));
+        let once = config.clone();
+        manager.migrate_shared_config(&mut config).unwrap();
+        assert_eq!(once, config);
+        drop(manager);
+        hkcu.delete_subkey_all(&root).unwrap();
+    }
+
+    #[test]
+    fn migration_rejects_unverified_alias_without_changing_shared_config() {
+        let (hkcu, root, manager) = identity_fixture("identity-conflict");
+        let mut config = crate::config::BlueVeinConfig::new();
+        let mut alias = BluetoothDevice::le_with_ltk("41:22:33:44:55:66".into(), key());
+        alias.le.as_mut().unwrap().irk = Some("88".repeat(16));
+        config.update_device("00:11:22:33:44:55".into(), alias);
+        let before = config.clone();
+        assert!(manager.migrate_shared_config(&mut config).is_err());
+        assert_eq!(before, config);
+        drop(manager);
+        hkcu.delete_subkey_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sc_security_type_is_not_inferred_from_requested_mitm() {
+        assert_eq!(windows_ltk_type(None, Some(0x2d), Some(0), Some(0)), 2);
+        assert_eq!(windows_ltk_type(Some(1), Some(0x2d), Some(0), Some(0)), 3);
+        assert_eq!(windows_ltk_type(Some(1), Some(0x05), Some(7), Some(9)), 1);
+        assert_eq!(windows_ltk_type(None, None, Some(0), Some(0)), 0);
+    }
+
     fn key() -> LeLongTermKey {
         LeLongTermKey { key: "11".repeat(16), authenticated: Some(1),
             enc_size: Some(16), ediv: Some(0), rand: Some(0) }
@@ -633,7 +868,6 @@ mod tests {
             classic: None, le: Some(LeKeys { irk: Some("22".repeat(16)), ..Default::default() }) };
         let mut desired = current.clone();
         desired.le.as_mut().unwrap().peripheral_ltk = Some(key());
-        desired.le.as_mut().unwrap().address_type = Some("public".into());
         assert_eq!(registry_projection(&current), registry_projection(&desired));
         assert!(desired.le.as_ref().unwrap().peripheral_ltk.is_some());
     }

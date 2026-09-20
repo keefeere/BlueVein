@@ -127,7 +127,7 @@ impl SyncManager {
         );
 
         // Read config from EFI (may not exist)
-        let efi_config = match self.store.read() {
+        let mut efi_config = match self.store.read() {
             Ok(config) => {
                 log!("[BlueVein] Found existing EFI config");
                 Some(config)
@@ -142,6 +142,10 @@ impl SyncManager {
             }
         };
 
+        let original_config = efi_config.clone();
+        if let Some(config) = efi_config.as_mut() {
+            self.bt_manager.migrate_shared_config(config)?;
+        }
         // Read current system state
         let mut system_config = BlueVeinConfig::new();
         let adapters = match self.bt_manager.get_adapters() {
@@ -175,7 +179,6 @@ impl SyncManager {
             }
         }
 
-        let original_config = efi_config.clone();
         // Merge strategy: Update existing devices from EFI, add new system devices to EFI
         let final_config = if let Some(mut efi_cfg) = efi_config {
             log!("[BlueVein] Merging EFI config with system state");
