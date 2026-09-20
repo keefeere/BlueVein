@@ -359,7 +359,7 @@ Monitor->>OS: Applies new keys to existing devices
 
 - **On boot:** BlueVein checks keys in EFI and updates them for devices present in the system. New devices from the system are added to EFI
 - **On new pairing:** The key is immediately saved to EFI and becomes available to the other OS
-- **On removal:** The device remains in EFI (it may be active on the other OS)
+- **On removal:** A bond that disappears after BlueVein observed it locally gets a pending-deletion marker in EFI. The other OS removes its matching bond, then clears the EFI record. A missing bond at startup is not treated as a deletion; mismatched keys are never removed automatically. See [the deletion protocol](docs/windows-le-sync.md#pairing-removal-protocol-candidate-2026-09-20).
 - **Periodically:** Checks for changes every 30 seconds and applies key updates from EFI
 
 ## <a name="technical-details"></a>🔬 Technical Details
