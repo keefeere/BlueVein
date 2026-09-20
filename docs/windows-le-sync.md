@@ -40,7 +40,9 @@ startup uses the same planner. Set `BLUEVEIN_EFI_DEVICE` as for the service.
 The automated suite covers several missing devices, empty adapters, incomplete
 records, foreign adapters, dry-run/EFI-only behavior, repeated synchronization,
 and real BlueZ file round trips with legacy and Secure Connections metadata.
-Physical input, reboot and cross-OS acceptance still require device testing.
+The automated suite does not establish physical reconnect behavior. A Windows
+deployment and one subsequent Linux reboot have now been tested on the same
+adapter; see the status below.
 
 ### Existing host privacy finding
 
@@ -49,8 +51,8 @@ to be recognized by the existing iPhone bond. With a reversed Linux IRK, origina
 LTK, and public host address, the physical capture showed successful AES-CCM
 encryption and Linux created keyboard/mouse HID devices. Reversing LTK did not
 help. This adapter-wide privacy choice exposes the public Bluetooth address;
-reboot and return-to-Windows acceptance remain required. Other devices and Macs
-must retain their pairing/channel settings.
+Repeated reboot and return-to-Windows acceptance remain required. Other devices
+and Macs must retain their pairing/channel settings.
 
 ## Root cause verified on a dual-boot host
 
@@ -109,7 +111,22 @@ A live read-only audit verified that the affected peer's migration requires no
 Windows key writes. Deployment additionally checks key equality, unchanged other
 EFI records, unchanged Windows registry values, and the actual service process.
 
-Physical Linux reconnect and subsequent Windows return must still be tested.
+On the tested dual-boot host, the updated Windows exporter preserved the live
+Windows bonds; the maintainer confirmed InpuDeck, MX Keys and MX Master input
+after a Linux-to-Windows transition. On the following Linux boot, BlueVein
+reported all three existing bonds correct and skipped the EFI write. All three
+attached over LE without a manual Connect, and the InpuDeck user watcher found
+HID already ready when it started. This is one successful boot sample; repeated
+Windows/Linux transitions and the delayed Windows InpuDeck reconnect remain
+unresolved acceptance checks.
+
+The intermittent Linux LE connection timeout was separately traced to
+[BlueZ issue #2356](https://github.com/bluez/bluez/issues/2356): a dual-mode
+bonded peer advertising with a private address lacked the controller's address
+resolution flag. Setting that flag allowed the next HID connection, and a
+startup workaround lives in InpuDeck's Linux host setup, not in BlueVein.
+BlueVein manages keys, not controller connection flags or reconnect requests.
+
 Startup retains upstream EFI precedence for unrelated conflicting offline edits;
 there is no persisted three-way conflict history. This branch must not be described
 as resolving arbitrary simultaneous offline pairing changes.

@@ -70,7 +70,9 @@ Headphones don't work again → **Pair again**
 
 Pair your device **once** in any OS. \
 Switch between Windows and Linux. \
-**Everything works automatically**. Forever.
+BlueVein keeps the pairing keys synchronized automatically. Reconnection still
+depends on the Bluetooth stack in each OS; a valid bond alone cannot repair a
+host-side connection bug.
 
 ## 🌟 Why BlueVein?
 
@@ -435,6 +437,7 @@ BlueVein is **fully automatic** and works in real-time as a background service.
 | ❌ **Service won't start (Linux)** | Run `sudo systemctl status bluevein` and check logs: `sudo journalctl -u bluevein -n 50` |
 | ❌ **Service won't start (Windows)** | Make sure PowerShell is running **as Administrator** |
 | ❌ **Device still won't sync** | Check that EFI partition is mounted: `lsblk -f \| grep vfat` (Linux) or verify the service is running |
+| ❌ **Keys match, but Linux does not reconnect** | Check the LE/Classic connection and HID profile separately. BlueVein synchronizes bonds; it does not scan for or connect devices. BlueZ 5.87 has a [dual-mode private-address reconnect issue](https://github.com/bluez/bluez/issues/2356) that needs a separate host workaround. |
 | ❌ **Permission denied** | BlueVein requires root/admin. On Linux use `sudo systemctl` or run the service as root |
 
 > [!TIP]
