@@ -22,6 +22,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         if args.len() > 1 {
             match args[1].as_str() {
                 "audit-sync" | "sync-once" => {
+                    if args.len() != 2 && args.len() != 4 {
+                        return Err("Usage: audit-sync|sync-once [adapter-mac identity-mac]".into());
+                    }
+                    if args.len() == 4 {
+                        for address in &args[2..4] {
+                            if !crate::bluetooth::is_valid_mac_hex(&crate::bluetooth::mac_to_windows_format(address)) {
+                                return Err("Invalid scoped Bluetooth address".into());
+                            }
+                        }
+                        std::env::set_var("BLUEVEIN_ADAPTER_FILTER", &args[2]);
+                        std::env::set_var("BLUEVEIN_DEVICE_FILTER", &args[3]);
+                    }
                     let manager = Box::new(bluetooth::WindowsBluetoothManager::new()?);
                     let context = EfiContext::from_env();
                     let mut sync = SyncManager::new(manager, context);

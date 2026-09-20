@@ -530,6 +530,9 @@ impl BluetoothManager for WindowsBluetoothManager {
             let keys = self.open_bluetooth_keys()?;
             let adapter = keys.open_subkey_with_flags(mac_to_windows_format(&adapter_mac), KEY_READ)?;
             for (storage, identity, _) in Self::le_locations(&adapter)? {
+                if let Ok(filter) = std::env::var("BLUEVEIN_DEVICE_FILTER") {
+                    if identity != normalize_mac(&filter) { continue; }
+                }
                 let alias = windows_format_to_mac(&storage);
                 if alias == identity { continue; }
                 let Some(old_alias) = config.get_device(&adapter_mac, &alias).cloned() else { continue; };
@@ -608,6 +611,9 @@ impl BluetoothManager for WindowsBluetoothManager {
                 adapters.push(windows_format_to_mac(&name));
             }
         }
+        if let Ok(filter) = std::env::var("BLUEVEIN_ADAPTER_FILTER") {
+            adapters.retain(|adapter| *adapter == normalize_mac(&filter));
+        }
         Ok(adapters)
     }
 
@@ -629,6 +635,9 @@ impl BluetoothManager for WindowsBluetoothManager {
             if classic.is_some() || le.is_some() {
                 devices.push(BluetoothDevice { mac_address: mac, classic, le });
             }
+        }
+        if let Ok(filter) = std::env::var("BLUEVEIN_DEVICE_FILTER") {
+            devices.retain(|device| device.mac_address == normalize_mac(&filter));
         }
         Ok(devices)
     }
