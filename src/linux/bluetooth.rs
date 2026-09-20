@@ -11,10 +11,62 @@ use std::process::Command;
 
 const BLUETOOTH_LIB_PATH: &str = "/var/lib/bluetooth";
 
+// Explicit compatibility override for existing Windows-format shared records.
+// Use the same involution on import and export; never change the shared key.
+fn translate_irk(key: &str, adapter: &str, peer: &str, peers: &str) -> Result<String, Box<dyn Error>> {
+    let selected = format!("{}/{}", normalize_mac(adapter), normalize_mac(peer));
+    let mut reverse = false;
+    for entry in peers.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (a, p) = entry.split_once('/').ok_or("Invalid Linux IRK override; expected adapter/peer")?;
+        for mac in [a, p] {
+            if mac.len() != 17 || mac.split(':').count() != 6 ||
+                !mac.split(':').all(|b| b.len() == 2 && b.bytes().all(|c| c.is_ascii_hexdigit())) {
+                return Err("Invalid MAC in Linux IRK override".into());
+            }
+        }
+        reverse |= entry.eq_ignore_ascii_case(&selected);
+    }
+    if !reverse { return Ok(key.to_string()); }
+    validate_bluetooth_key(key, "IRK")?;
+    let mut bytes = hex::decode(key).map_err(|_| "Invalid IRK encoding")?;
+    bytes.reverse();
+    Ok(hex::encode_upper(bytes))
+}
+
+fn configured_irk(key: &str, adapter: &str, peer: &str) -> Result<String, Box<dyn Error>> {
+    let peers = std::env::var("BLUEVEIN_LINUX_REVERSE_IRK_PEERS").unwrap_or_default();
+    translate_irk(key, adapter, peer, &peers)
+}
+
+#[cfg(test)]
+mod irk_encoding_tests {
+    use super::translate_irk;
+    const A: &str = "44:F7:9F:AC:CD:9C";
+    const P: &str = "10:A2:D3:01:47:A1";
+    const KEY: &str = "000102030405060708090A0B0C0D0E0F";
+    #[test]
+    fn scoped_conversion_round_trips_shared_windows_record() {
+        let selected = format!("{A}/{P}");
+        let linux = translate_irk(KEY, A, P, &selected).unwrap();
+        assert_eq!(linux, "0F0E0D0C0B0A09080706050403020100");
+        assert_eq!(translate_irk(&linux, A, P, &selected).unwrap(), KEY);
+        assert_eq!(translate_irk(KEY, A, "10:A2:D3:01:47:A2", &selected).unwrap(), KEY);
+        assert_eq!(translate_irk(KEY, "44:F7:9F:AC:CD:9D", P, &selected).unwrap(), KEY);
+        assert_eq!(translate_irk(KEY, A, P, "").unwrap(), KEY);
+    }
+    #[test]
+    fn invalid_override_is_rejected_even_for_unselected_peer() {
+        assert!(translate_irk(KEY, A, P, "invalid").is_err());
+        assert!(translate_irk(KEY, A, P, "00:00:00:00:00:ZZ/10:A2:D3:01:47:A1").is_err());
+    }
+}
+
 pub struct LinuxBluetoothManager;
 
 impl LinuxBluetoothManager {
     pub fn new() -> Result<Self, Box<dyn Error>> {
+        // Reject malformed configuration before any synchronization starts.
+        configured_irk("00000000000000000000000000000000", "00:00:00:00:00:00", "00:00:00:00:00:00")?;
         Ok(Self)
     }
 
@@ -140,7 +192,7 @@ impl LinuxBluetoothManager {
                         e
                     );
                 } else {
-                    le_keys.irk = Some(key.clone());
+                    le_keys.irk = Some(configured_irk(key, adapter_mac, device_mac)?);
                     has_le = true;
                 }
             }
@@ -359,7 +411,7 @@ impl LinuxBluetoothManager {
                 let irk_section = sections
                     .entry("IdentityResolvingKey".to_string())
                     .or_insert_with(HashMap::new);
-                irk_section.insert("Key".to_string(), irk.clone());
+                irk_section.insert("Key".to_string(), configured_irk(irk, adapter_mac, &device.mac_address)?);
             }
 
             // LocalSignatureKey

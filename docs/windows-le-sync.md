@@ -1,5 +1,24 @@
 # Windows LE identity synchronization repair
 
+## Linux compatibility for an existing Windows-format IRK
+
+On the tested host, the shared iPhone IRK bytes resolve its advertised RPA only
+after reversal at the Linux storage boundary. A scoped Linux override is available:
+`BLUEVEIN_LINUX_REVERSE_IRK_PEERS=44:F7:9F:AC:CD:9C/10:A2:D3:01:47:A1`.
+Multiple adapter/peer pairs may be comma-separated. Invalid entries fail startup.
+The conversion applies symmetrically on Linux read and write, preserving the shared
+EFI representation and compatibility with the deployed Windows binary. It does
+not reverse LTKs or change unlisted bonds. This is an explicit compatibility
+setting, not automatic format detection or a global key-format migration.
+
+The same host required `Privacy=off` in BlueZ for its public controller identity
+to be recognized by the existing iPhone bond. With a reversed Linux IRK, original
+LTK, and public host address, the physical capture showed successful AES-CCM
+encryption and Linux created keyboard/mouse HID devices. Reversing LTK did not
+help. This adapter-wide privacy choice exposes the public Bluetooth address;
+reboot and return-to-Windows acceptance remain required. Other devices and Macs
+must retain their pairing/channel settings.
+
 ## Root cause verified on a dual-boot host
 
 Windows stored the working HID bond under a pairing-time resolvable private
