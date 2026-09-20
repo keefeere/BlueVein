@@ -22,6 +22,7 @@ pub fn monitor_bluetooth_changes(
 ) -> Result<(), Box<dyn Error>> {
     log!("[BlueVein] Monitoring Classic and LE records");
     let mut previous = sync_manager.local_snapshot()?;
+    let mut missing: HashMap<(String, String), (BluetoothDevice, Instant)> = HashMap::new();
     let mut last_import = Instant::now();
     while running.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
@@ -37,6 +38,21 @@ pub fn monitor_bluetooth_changes(
             }
         }
         if !exported { continue; }
+        for (id, old_device) in &previous {
+            if !current.contains_key(id) {
+                missing.entry(id.clone()).or_insert_with(|| (old_device.clone(), Instant::now()));
+            }
+        }
+        missing.retain(|id, _| !current.contains_key(id));
+        let ready: Vec<_> = missing.iter()
+            .filter(|(_, (_, since))| since.elapsed() >= Duration::from_secs(3))
+            .map(|(id, (device, _))| (id.clone(), device.clone())).collect();
+        for ((adapter, mac), old_device) in ready {
+            match sync_manager.handle_device_removal(&adapter, &mac, &old_device) {
+                Ok(()) => { missing.remove(&(adapter, mac)); }
+                Err(e) => log!("[BlueVein] Deferred deletion marker for {}: {}", mac, e),
+            }
+        }
         previous = current;
         if last_import.elapsed() >= Duration::from_secs(30) {
             if let Err(e) = sync_manager.check_efi_changes() {

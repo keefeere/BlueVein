@@ -77,10 +77,18 @@ host-side connection bug.
 When Windows has a cached Bluetooth device name, BlueVein also carries it in
 the shared record. Linux uses it as the BlueZ `Name` while importing or updating
 the matching bond; an existing Linux `Alias` is preserved. Names are optional:
-older shared files and devices without a cached name remain valid. Historical
-bonds from Windows can still reappear in Linux because the shared device list
-is a union of both systems; BlueVein does not infer that a deletion in one OS
-should delete the pairing in the other.
+older shared files and devices without a cached name remain valid.
+
+When a running BlueVein instance has already observed and synchronized a local
+bond, then sees that bond removed, it writes a pending-deletion marker to EFI.
+On the next boot of the other OS, BlueVein unpairs that device only if its
+bonding key fingerprints match the removed bond, then removes the shared EFI
+record. A newly paired device at the same address is kept and replaces the old
+marker. A device missing on the first snapshot after boot does **not** imply
+deletion: older bonds from the other OS can still be imported. Failed or
+ambiguous unpair operations leave the marker in EFI for diagnosis. Install a
+version with this behavior on **both** operating systems before using deletion
+as a cross-OS cleanup mechanism.
 
 ## 🌟 Why BlueVein?
 

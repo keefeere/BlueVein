@@ -106,12 +106,56 @@ impl ClassicKeys {
 }
 
 /// Bluetooth device information (supports both Classic and LE)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingDeletion {
+    /// OS that observed an already-synchronized local bond disappear.
+    pub source: String,
+    pub classic_digest: Option<String>,
+    pub ltk_digests: Vec<String>,
+}
+
+impl PendingDeletion {
+    pub fn from_observed(source: &str, device: &BluetoothDevice) -> Self {
+        Self {
+            source: source.into(),
+            classic_digest: device.classic.as_ref().map(|key| key_digest(&key.link_key)),
+            ltk_digests: device.ltk_values().into_iter().map(key_digest).collect(),
+        }
+    }
+
+    pub fn matches_bond(&self, device: &BluetoothDevice) -> bool {
+        let mut matched = false;
+        if let (Some(expected), Some(classic)) = (&self.classic_digest, &device.classic) {
+            if expected != &key_digest(&classic.link_key) { return false; }
+            matched = true;
+        }
+        let current_ltks: Vec<_> = device.ltk_values().into_iter().map(key_digest).collect();
+        if !self.ltk_digests.is_empty() && !current_ltks.is_empty() {
+            if !current_ltks.iter().any(|value| self.ltk_digests.contains(value)) { return false; }
+            matched = true;
+        }
+        matched
+    }
+
+    pub fn comparable_with(&self, device: &BluetoothDevice) -> bool {
+        (self.classic_digest.is_some() && device.classic.is_some()) ||
+            (!self.ltk_digests.is_empty() && !device.ltk_values().is_empty())
+    }
+}
+
+fn key_digest(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(value.to_ascii_uppercase().as_bytes()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BluetoothDevice {
     pub mac_address: String,
     /// Last useful device name observed by either operating system.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_deletion: Option<PendingDeletion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classic: Option<ClassicKeys>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,12 +163,35 @@ pub struct BluetoothDevice {
 }
 
 impl BluetoothDevice {
+    /// Match bonding secrets, not names or OS-specific metadata. A newly paired
+    /// device at the same address must never inherit an old deletion request.
+    pub fn same_bond_as(&self, other: &BluetoothDevice) -> bool {
+        if !self.mac_address.eq_ignore_ascii_case(&other.mac_address) { return false; }
+        let mut matched = false;
+        if let (Some(a), Some(b)) = (&self.classic, &other.classic) {
+            if !a.link_key.eq_ignore_ascii_case(&b.link_key) { return false; }
+            matched = true;
+        }
+        let a = self.ltk_values();
+        let b = other.ltk_values();
+        if !a.is_empty() && !b.is_empty() {
+            if !a.iter().any(|key| b.iter().any(|other| key.eq_ignore_ascii_case(other))) { return false; }
+            matched = true;
+        }
+        matched
+    }
+
+    fn ltk_values(&self) -> Vec<&str> {
+        self.le.as_ref().map(|le| [&le.ltk, &le.peripheral_ltk]
+            .into_iter().flatten().map(|key| key.key.as_str()).collect()).unwrap_or_default()
+    }
     /// Create a classic Bluetooth device
     #[allow(dead_code)]
     pub fn classic(mac_address: String, link_key: String) -> Self {
         Self {
             mac_address,
             name: None,
+            pending_deletion: None,
             classic: Some(ClassicKeys::new(link_key)),
             le: None,
         }
@@ -136,6 +203,7 @@ impl BluetoothDevice {
         Self {
             mac_address,
             name: None,
+            pending_deletion: None,
             classic: None,
             le: Some(LeKeys {
                 ltk: Some(ltk),
@@ -157,6 +225,7 @@ impl BluetoothDevice {
         BluetoothDevice {
             mac_address: self.mac_address.clone(),
             name: other.name.clone().or_else(|| self.name.clone()),
+            pending_deletion: other.pending_deletion.clone().or_else(|| self.pending_deletion.clone()),
             classic: other.classic.clone().or_else(|| self.classic.clone()),
             le: match (&self.le, &other.le) {
                 (Some(le1), Some(le2)) => Some(Self::merge_le_keys(le1, le2)),
@@ -208,6 +277,24 @@ mod name_tests {
         assert!(!useful_device_name("bad\nname", &device.mac_address));
         assert!(useful_device_name("MX Keys", &device.mac_address));
     }
+
+    #[test]
+    fn bond_match_accepts_le_role_swap_but_rejects_repair() {
+        let key = LeLongTermKey { key: "11".repeat(16), authenticated: Some(2),
+            enc_size: Some(16), ediv: Some(0), rand: Some(0) };
+        let shared = BluetoothDevice::le_with_ltk("AA:BB:CC:DD:EE:FF".into(), key.clone());
+        let mut linux = shared.clone();
+        linux.le.as_mut().unwrap().ltk = None;
+        linux.le.as_mut().unwrap().peripheral_ltk = Some(key);
+        assert!(shared.same_bond_as(&linux));
+        let marker = PendingDeletion::from_observed("windows", &shared);
+        assert!(marker.matches_bond(&linux));
+        assert!(!serde_json::to_string(&marker).unwrap().contains(&"11".repeat(16)));
+        linux.le.as_mut().unwrap().peripheral_ltk.as_mut().unwrap().key = "22".repeat(16);
+        assert!(!shared.same_bond_as(&linux));
+        assert!(marker.comparable_with(&linux));
+        assert!(!marker.matches_bond(&linux));
+    }
 }
 
 /// Validate Bluetooth key length
@@ -246,6 +333,7 @@ pub fn validate_bluetooth_key(key: &str, key_name: &str) -> Result<(), Box<dyn E
 
 /// Trait for platform-specific Bluetooth management
 pub trait BluetoothManager: Send {
+    fn platform_id(&self) -> &'static str { "test" }
     /// Shared name wins by default; backends with a direct OS name source can override.
     fn choose_shared_name(&self, local: &BluetoothDevice, shared: &BluetoothDevice) -> Option<String> {
         shared.name.clone().or_else(|| local.name.clone())

@@ -551,6 +551,7 @@ impl WindowsBluetoothManager {
 }
 
 impl BluetoothManager for WindowsBluetoothManager {
+    fn platform_id(&self) -> &'static str { "windows" }
     fn update_reason(&self, current: &BluetoothDevice, desired: &BluetoothDevice) -> Option<String> {
         let (Some(local), Some(shared)) = (&current.le, &desired.le) else { return None; };
         if let (Some(local_irk), Some(shared_irk)) = (&local.irk, &shared.irk) {
@@ -685,7 +686,7 @@ impl BluetoothManager for WindowsBluetoothManager {
             let le = self.read_le_device(adapter_mac, &mac)?;
             if classic.is_some() || le.is_some() {
                 let name = self.read_device_name(adapter_mac, &mac);
-                devices.push(BluetoothDevice { mac_address: mac, name, classic, le });
+                devices.push(BluetoothDevice { mac_address: mac, name, pending_deletion: None, classic, le });
             }
         }
         if let Ok(filter) = std::env::var("BLUEVEIN_DEVICE_FILTER") {
@@ -709,6 +710,7 @@ impl BluetoothManager for WindowsBluetoothManager {
         Ok(BluetoothDevice {
             mac_address: normalize_mac(device_mac),
             name: self.read_device_name(adapter_mac, device_mac),
+            pending_deletion: None,
             classic,
             le,
         })
@@ -733,24 +735,16 @@ impl BluetoothManager for WindowsBluetoothManager {
     }
 
     fn remove_device(&mut self, adapter_mac: &str, device_mac: &str) -> Result<(), Box<dyn Error>> {
-        let adapter_key_name = mac_to_windows_format(adapter_mac);
-        let device_key_name = mac_to_windows_format(device_mac);
-
-        // Remove from classic registry
-        if let Ok(bt_keys) = self.open_bluetooth_keys() {
-            if let Ok(adapter_key) = bt_keys.open_subkey_with_flags(&adapter_key_name, KEY_WRITE) {
-                let _ = adapter_key.delete_value(&device_key_name);
-            }
+        let _ = adapter_mac;
+        // Use the Windows unpair API so PnP state and cached services are
+        // removed along with keys. Registry deletion alone is not an unpair.
+        let address = u64::from_str_radix(&mac_to_windows_format(device_mac), 16)?;
+        #[link(name = "Bthprops")]
+        extern "system" {
+            fn BluetoothRemoveDevice(address: *const u64) -> u32;
         }
-
-        // Remove from LE registry
-        if let Ok(bt_le_keys) = self.open_bluetooth_le_keys() {
-            if let Ok(adapter_key) = bt_le_keys.open_subkey_with_flags(&adapter_key_name, KEY_WRITE)
-            {
-                let _ = adapter_key.delete_subkey(&device_key_name);
-            }
-        }
-
+        let result = unsafe { BluetoothRemoveDevice(&address) };
+        if result != 0 { return Err(format!("Windows could not unpair {} (error {})", device_mac, result).into()); }
         Ok(())
     }
 }
@@ -790,6 +784,7 @@ fn decode_cached_name(bytes: &[u8], kind: RegType) -> Option<String> {
 fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
     let mut result = device.clone();
     result.name = None;
+    result.pending_deletion = None;
     if let Some(classic) = result.classic.as_mut() {
         classic.link_key.make_ascii_uppercase();
         classic.key_type = 4;
@@ -1024,7 +1019,7 @@ mod tests {
 
     #[test]
     fn iphone_irk_only_does_not_reimport_linux_metadata() {
-        let current = BluetoothDevice { mac_address: "AA:BB:CC:DD:EE:FF".into(), name: None,
+        let current = BluetoothDevice { mac_address: "AA:BB:CC:DD:EE:FF".into(), name: None, pending_deletion: None,
             classic: None, le: Some(LeKeys { irk: Some("22".repeat(16)), ..Default::default() }) };
         let mut desired = current.clone();
         desired.le.as_mut().unwrap().peripheral_ltk = Some(key());

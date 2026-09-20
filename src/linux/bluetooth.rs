@@ -96,6 +96,7 @@ impl LinuxBluetoothManager {
         let mut device = BluetoothDevice {
             mac_address: normalize_mac(device_mac),
             name: None,
+            pending_deletion: None,
             classic: None,
             le: None,
         };
@@ -512,11 +513,14 @@ impl LinuxBluetoothManager {
 }
 
 impl BluetoothManager for LinuxBluetoothManager {
+    fn platform_id(&self) -> &'static str { "linux" }
     fn needs_update(&self, current: &BluetoothDevice, desired: &BluetoothDevice) -> bool {
         let mut current_keys = current.clone();
         let mut desired_keys = desired.clone();
         current_keys.name = None;
         desired_keys.name = None;
+        current_keys.pending_deletion = None;
+        desired_keys.pending_deletion = None;
         current_keys != desired_keys ||
             (desired.name.as_ref().is_some_and(|name| useful_device_name(name, &desired.mac_address))
                 && current.name != desired.name)
@@ -632,13 +636,30 @@ impl BluetoothManager for LinuxBluetoothManager {
     }
 
     fn remove_device(&mut self, adapter_mac: &str, device_mac: &str) -> Result<(), Box<dyn Error>> {
-        let device_path = Self::get_adapter_info_path(adapter_mac).join(normalize_mac(device_mac));
-
-        if device_path.exists() {
-            fs::remove_dir_all(&device_path)
-                .map_err(|e| format!("Failed to remove device directory: {}", e))?;
+        // Ask the running daemon to forget the bond. Removing its info file
+        // behind bluetoothd's back lets it recreate the old bond on shutdown.
+        let tree = Command::new("busctl").args(["tree", "org.bluez"]).output()?;
+        if !tree.status.success() { return Err("Cannot enumerate BlueZ adapters".into()); }
+        let mut adapter_path = None;
+        for path in String::from_utf8(tree.stdout)?.lines().filter_map(|line| line.split_whitespace().last()) {
+            if !path.starts_with("/org/bluez/hci") || path["/org/bluez/".len()..].contains('/') { continue; }
+            let value = Command::new("busctl")
+                .args(["get-property", "org.bluez", path, "org.bluez.Adapter1", "Address"])
+                .output()?;
+            if value.status.success() && String::from_utf8(value.stdout)?.contains(&normalize_mac(adapter_mac)) {
+                adapter_path = Some(path.to_string());
+                break;
+            }
         }
-
+        let adapter_path = adapter_path.ok_or("Bluetooth adapter is not exported by BlueZ")?;
+        let device_path = format!("{}/dev_{}", adapter_path, normalize_mac(device_mac).replace(':', "_"));
+        let result = Command::new("busctl").args([
+            "call", "org.bluez", &adapter_path, "org.bluez.Adapter1", "RemoveDevice", "o", &device_path,
+        ]).output()?;
+        if !result.status.success() {
+            return Err(format!("BlueZ refused to remove {}: {}", device_mac,
+                String::from_utf8_lossy(&result.stderr).trim()).into());
+        }
         Ok(())
     }
 }
@@ -647,7 +668,7 @@ impl BluetoothManager for LinuxBluetoothManager {
 mod general_import_tests {
     use super::*;
     fn bond() -> BluetoothDevice {
-        BluetoothDevice { mac_address: "D0:11:22:33:44:55".into(), name: None, classic: None,
+        BluetoothDevice { mac_address: "D0:11:22:33:44:55".into(), name: None, pending_deletion: None, classic: None,
             le: Some(LeKeys { address_type: Some("random".into()),
                 irk: Some("000102030405060708090A0B0C0D0E0F".into()), irk_encoding: Some("windows".into()),
                 ltk: Some(LeLongTermKey { key: "AA".repeat(16), authenticated: Some(2), enc_size: Some(16), ediv: Some(0), rand: Some(0) }),

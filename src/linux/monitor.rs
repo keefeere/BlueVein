@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const BLUETOOTH_LIB_PATH: &str = "/var/lib/bluetooth";
 
@@ -54,6 +55,10 @@ pub async fn monitor_bluetooth_changes(
         "[BlueVein] Monitoring {} for Bluetooth changes...",
         BLUETOOTH_LIB_PATH
     );
+
+    // Only a bond observed after a successful startup sync can generate a
+    // deletion marker. A record merely absent at boot is not evidence.
+    let mut known = sync_manager.local_snapshot()?;
 
     let mut buffer = [0; 4096];
     loop {
@@ -111,6 +116,10 @@ pub async fn monitor_bluetooth_changes(
                                                 .handle_device_change(adapter_mac, device_mac)
                                             {
                                                 log!("[BlueVein] Failed to sync device: {}", e);
+                                            } else if let Ok(snapshot) = sync_manager.local_snapshot() {
+                                                if let Some(device) = snapshot.get(&(adapter_mac.to_string(), device_mac.to_string())) {
+                                                    known.insert((adapter_mac.to_string(), device_mac.to_string()), device.clone());
+                                                }
                                             }
                                         }
                                     }
@@ -132,10 +141,15 @@ pub async fn monitor_bluetooth_changes(
                                     name_str,
                                     adapter_mac
                                 );
-                                if let Err(e) =
-                                    sync_manager.handle_device_removal(adapter_mac, &name_str)
-                                {
-                                    log!("[BlueVein] Failed to handle device removal: {}", e);
+                                let id = (adapter_mac.to_string(), name_str.clone());
+                                if let Some(previous) = known.get(&id).cloned() {
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    if !full_path.exists() {
+                                        match sync_manager.handle_device_removal(adapter_mac, &name_str, &previous) {
+                                            Ok(()) => { known.remove(&id); }
+                                            Err(e) => log!("[BlueVein] Failed to mark device removal: {}", e),
+                                        }
+                                    }
                                 }
                             } else if event.mask.contains(inotify::EventMask::CREATE)
                                 || event.mask.contains(inotify::EventMask::MOVED_TO)
