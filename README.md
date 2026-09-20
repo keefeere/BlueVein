@@ -80,7 +80,7 @@ Switch between Windows and Linux. \
 |:---:|:---|
 | 🔄 **Bidirectional sync** | Changes in any OS are instantly synchronized |
 | 🚀 **Zero configuration** | Install → Run → Forget about the problem |
-| 💾 **Direct EFI access** | No partition mounting via [fat32-raw](https://github.com/meowrch/fat32-raw) |
+| 💾 **EFI access** | Uses the mounted EFI filesystem on Linux when available; otherwise [fat32-raw](https://github.com/meowrch/fat32-raw) |
 | 🛡️ **Security** | Works at system level with administrator privileges |
 | 📡 **Real-time monitoring** | Tracks changes instantly |
 | 🔍 **Periodic checking** | Checks for updates from the other OS every 30 seconds |
@@ -364,9 +364,10 @@ BlueVein uses **`EfiContext`** to manage EFI partition access:
 
 - **Automatic detection:** By default, BlueVein automatically finds the EFI partition at standard mount points (`/boot/efi`, `/efi`, `/boot` on Linux)
 - **Manual specification:** Use the `BLUEVEIN_EFI_DEVICE` environment variable to explicitly specify a device
-- **Two-level access:**
-  1. First checks mounted EFI partition (faster, no cache issues)
-  2. If not found — uses direct access via `fat32-raw`
+- **Linux access:** Even with `BLUEVEIN_EFI_DEVICE` set, BlueVein reads and atomically writes through the mounted EFI filesystem when that device is mounted. It synchronizes the filesystem after a write so a subsequent raw read sees the same FAT chain. Raw access is used only when the selected EFI device is unmounted.
+- **Windows access:** Uses direct access via `fat32-raw`.
+
+Do not write to a mounted FAT filesystem through its block device. The kernel can retain cached FAT metadata and later overwrite or misinterpret the raw changes.
 
 **Benefits of this approach:**
 - Flexibility in complex configurations (multiple EFI partitions, RAID, LVM)
