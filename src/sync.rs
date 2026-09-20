@@ -121,14 +121,18 @@ impl SyncManager {
     ///      * If it's NOT in EFI → ADD to EFI (new pairing on this OS)
     /// 4. Write updated bluevein.json back to EFI
     pub fn sync_bidirectional(&mut self) -> Result<(), Box<dyn Error>> {
-        self.sync_bidirectional_mode(true)
+        self.sync_bidirectional_mode(true, true)
     }
 
     pub fn preview_bidirectional(&mut self) -> Result<(), Box<dyn Error>> {
-        self.sync_bidirectional_mode(false)
+        self.sync_bidirectional_mode(false, false)
     }
 
-    fn sync_bidirectional_mode(&mut self, apply: bool) -> Result<(), Box<dyn Error>> {
+    pub fn repair_efi_only(&mut self) -> Result<(), Box<dyn Error>> {
+        self.sync_bidirectional_mode(true, false)
+    }
+
+    fn sync_bidirectional_mode(&mut self, apply: bool, allow_local_writes: bool) -> Result<(), Box<dyn Error>> {
         log!(
             "[BlueVein] Starting bidirectional synchronization (EFI device: {})...",
             self.store.display_name()
@@ -216,6 +220,9 @@ impl SyncManager {
                                     if !apply {
                                         log!("[BlueVein] AUDIT would update local keys for {}", device_mac);
                                         continue;
+                                    }
+                                    if !allow_local_writes {
+                                        return Err(format!("EFI-only repair would change local keys for {}", device_mac).into());
                                     }
                                     match self.bt_manager.set_device(adapter_mac, &merged) {
                                         Ok(_) => {
@@ -633,6 +640,16 @@ mod tests {
         state.shared.update_device("adapter".into(), shared);
         let state = Arc::new(Mutex::new(state));
         (SyncManager { bt_manager: Box::new(Backend(state.clone())), store: Box::new(Store(state.clone())) }, state)
+    }
+
+    #[test]
+    fn efi_only_repair_refuses_any_local_key_change() {
+        let (mut sync, state) = setup(device("11"), device("22"));
+        assert!(sync.repair_efi_only().is_err());
+        let state = state.lock().unwrap();
+        assert_eq!(state.local_writes, 0);
+        assert_eq!(state.shared_writes, 0);
+        assert_eq!(state.local.get("phone"), Some(&device("11")));
     }
 
     #[test]

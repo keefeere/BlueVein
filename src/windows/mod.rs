@@ -21,7 +21,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         if args.len() > 1 {
             match args[1].as_str() {
-                "audit-sync" | "sync-once" => {
+                "audit-sync" | "sync-once" | "repair-efi-only" => {
                     if args.len() != 2 && args.len() != 4 {
                         return Err("Usage: audit-sync|sync-once [adapter-mac identity-mac]".into());
                     }
@@ -37,7 +37,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     let manager = Box::new(bluetooth::WindowsBluetoothManager::new()?);
                     let context = EfiContext::from_env();
                     let mut sync = SyncManager::new(manager, context);
-                    if args[1] == "audit-sync" { sync.preview_bidirectional() } else { sync.sync_bidirectional() }
+                    match args[1].as_str() {
+                        "audit-sync" => sync.preview_bidirectional(),
+                        "repair-efi-only" => sync.repair_efi_only(),
+                        _ => sync.sync_bidirectional(),
+                    }
                 },
                 "install" => service::install_service(),
                 "uninstall" => service::uninstall_service(),
