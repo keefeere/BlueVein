@@ -114,13 +114,15 @@ impl SyncManager {
     /// 2. Read current Bluetooth state from system
     /// 3. MERGE strategy:
     ///    - For each device in EFI:
-    ///      * If device does NOT exist in system → SKIP (don't create)
+    ///      * If absent locally → import when the backend validates a complete bond
     ///      * If device exists but keys differ → UPDATE keys from EFI (merge both Classic and LE)
     ///    - For each device in system:
     ///      * If it's NOT in EFI → ADD to EFI (new pairing on this OS)
     /// 4. Write updated bluevein.json back to EFI
     pub fn sync_bidirectional(&mut self) -> Result<(), Box<dyn Error>> {
-        self.sync_bidirectional_mode(true, true)
+        let result = self.sync_bidirectional_mode(true, true);
+        let applied = self.bt_manager.apply_pending();
+        result.and(applied)
     }
 
     pub fn preview_bidirectional(&mut self) -> Result<(), Box<dyn Error>> {
@@ -171,7 +173,7 @@ impl SyncManager {
         for adapter_mac in &adapters {
             match self.bt_manager.get_devices(adapter_mac) {
                 Ok(devices) => {
-                    if !devices.is_empty() {
+                    {
                         log!(
                             "[BlueVein] Found {} devices for adapter {}",
                             devices.len(),
@@ -207,6 +209,10 @@ impl SyncManager {
                                 // Merge to combine both Classic and LE keys if needed
                                 let merged = Self::merge_devices(system_device, efi_device);
 
+                                if let Some(reason) = self.bt_manager.update_reason(system_device, &merged) {
+                                    log!("[BlueVein] Cannot update {}: {}", device_mac, reason);
+                                    continue;
+                                }
                                 merged_devices.push(merged.clone());
                                 if self.bt_manager.needs_update(system_device, &merged) {
                                     // Keys differ or missing - update from merged result
@@ -238,8 +244,7 @@ impl SyncManager {
                                     );
                                 }
                             } else {
-                                // Device in EFI but NOT in system - don't create it
-                                log!("[BlueVein]   ○ Device {} exists in EFI but not in system - skipping (will sync on re-pair)", device_mac);
+                                self.import_missing(adapter_mac, efi_device, apply, allow_local_writes)?;
                             }
                         }
                     }
@@ -309,49 +314,26 @@ impl SyncManager {
         Ok(())
     }
 
+    fn import_missing(&mut self, adapter: &str, device: &BluetoothDevice, apply: bool, allow_local_writes: bool) -> Result<(), Box<dyn Error>> {
+        if let Some(reason) = self.bt_manager.import_missing_reason(device) {
+            log!("[BlueVein] Cannot import {}: {}", device.mac_address, reason);
+            return Ok(());
+        }
+        if !apply {
+            log!("[BlueVein] AUDIT would import missing bond {}", device.mac_address);
+            return Ok(());
+        }
+        if !allow_local_writes { return Err("EFI-only repair would create a local bond".into()); }
+        self.bt_manager.set_device(adapter, device)?;
+        log!("[BlueVein] Imported missing bond {}", device.mac_address);
+        Ok(())
+    }
+
     /// Perform initial synchronization from EFI to system
     /// This reads the shared config and updates system Bluetooth keys
     #[allow(dead_code)]
     pub fn sync_from_efi(&mut self) -> Result<(), Box<dyn Error>> {
-        log!("[BlueVein] Starting synchronization from EFI...");
-
-        // Read config from EFI
-        let config = match self.store.read() {
-            Ok(config) => config,
-            Err(efi::EfiError::NotFound) => {
-                log!("[BlueVein] No existing config found on EFI, will create on first change");
-                return Ok(());
-            }
-            Err(e) => return Err(Box::new(e)),
-        };
-
-        // Get local adapters
-        let adapters = self.bt_manager.get_adapters()?;
-
-        // For each adapter, sync devices
-        for adapter_mac in adapters {
-            if let Some(devices) = config.get_adapter_devices(&adapter_mac) {
-                log!(
-                    "[BlueVein] Syncing {} devices for adapter {}",
-                    devices.len(),
-                    adapter_mac
-                );
-
-                for (device_mac, device) in devices {
-                    match self.bt_manager.set_device(&adapter_mac, device) {
-                        Ok(_) => log!("[BlueVein]   ✓ Updated keys for device {}", device_mac),
-                        Err(e) => log!(
-                            "[BlueVein]   ✗ Failed to update device {}: {}",
-                            device_mac,
-                            e
-                        ),
-                    }
-                }
-            }
-        }
-
-        log!("[BlueVein] Synchronization from EFI complete");
-        Ok(())
+        self.sync_bidirectional()
     }
 
     /// Sync current system state to EFI
@@ -514,53 +496,12 @@ impl SyncManager {
     /// Check EFI for changes and apply them to the system
     /// This allows changes made by another OS to be detected
     ///
-    /// Only updates keys for devices that already exist in the system.
-    /// Does NOT create new devices.
+    /// Uses the same validated missing-bond import policy as startup.
     #[allow(dead_code)]
     pub fn check_efi_changes(&mut self) -> Result<(), Box<dyn Error>> {
-        // Read config from EFI
-        let config = match self.store.read() {
-            Ok(config) => config,
-            Err(efi::EfiError::NotFound) => {
-                return Ok(());
-            }
-            Err(e) => return Err(Box::new(e)),
-        };
-
-        // Get local adapters
-        let adapters = self.bt_manager.get_adapters()?;
-
-        // For each adapter, check for differences and update
-        for adapter_mac in adapters {
-            if let Some(efi_devices) = config.get_adapter_devices(&adapter_mac) {
-                // Get current system devices
-                let system_devices = self.bt_manager.get_devices(&adapter_mac)?;
-                let system_map: HashMap<String, BluetoothDevice> = system_devices
-                    .into_iter()
-                    .map(|d| (d.mac_address.clone(), d))
-                    .collect();
-
-                // Apply changes from EFI only for devices that exist in system
-                for (device_mac, efi_device) in efi_devices {
-                    if let Some(system_device) = system_map.get(device_mac) {
-                        // Device exists in system - merge and check if keys differ
-                        let merged = Self::merge_devices(system_device, efi_device);
-                        if self.bt_manager.needs_update(system_device, &merged) {
-                            log!(
-                                "[BlueVein] Key mismatch for {} - updating from EFI",
-                                device_mac
-                            );
-                            self.bt_manager.set_device(&adapter_mac, &merged)?;
-                        }
-                    }
-                    // If device doesn't exist in system - don't create it
-                    // User will pair it manually if needed
-                }
-            }
-        }
-
-        Ok(())
+        self.sync_bidirectional()
     }
+
 }
 
 #[cfg(test)]
@@ -576,12 +517,25 @@ mod tests {
         local_writes: usize,
         shared_writes: usize,
         fail_local_read: bool,
+        allow_missing: bool,
+        activations: usize,
+        pending: bool,
         fail_local_write: bool,
         discard_shared_write: bool,
         fail_read_after_write: bool,
     }
     struct Backend(Arc<Mutex<State>>);
     impl BluetoothManager for Backend {
+        fn import_missing_reason(&self, device: &BluetoothDevice) -> Option<String> {
+            if !self.0.lock().unwrap().allow_missing { return Some("existing bond required".into()); }
+            if device.le.as_ref().and_then(|le| le.ltk.as_ref()).is_none() { return Some("incomplete bond".into()); }
+            None
+        }
+        fn apply_pending(&mut self) -> Result<(), Box<dyn Error>> {
+            let mut state = self.0.lock().unwrap();
+            if state.pending { state.activations += 1; state.pending = false; }
+            Ok(())
+        }
         fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>> { Ok(vec!["adapter".into()]) }
         fn get_devices(&self, _: &str) -> Result<Vec<BluetoothDevice>, Box<dyn Error>> {
             let state = self.0.lock().unwrap();
@@ -596,6 +550,7 @@ mod tests {
             if state.fail_local_write { return Err("simulated failed registry write".into()); }
             state.local.insert(device.mac_address.clone(), device.clone());
             state.local_writes += 1;
+            state.pending = true;
             Ok(())
         }
         fn remove_device(&mut self, _: &str, _: &str) -> Result<(), Box<dyn Error>> { Ok(()) }
@@ -628,6 +583,56 @@ mod tests {
         state.shared.update_device("adapter".into(), shared);
         let state = Arc::new(Mutex::new(state));
         (SyncManager { bt_manager: Box::new(Backend(state.clone())), store: Box::new(Store(state.clone())) }, state)
+    }
+
+    #[test]
+    fn empty_adapter_imports_multiple_bonds_once_and_converges() {
+        let (mut sync, state) = setup(device("22"), device("11"));
+        {
+            let mut s = state.lock().unwrap(); s.local.clear(); s.allow_missing = true;
+            for name in ["keyboard1", "keyboard2", "mouse1", "mouse2"] {
+                let mut d = device("33"); d.mac_address = name.into(); s.shared.update_device("adapter".into(), d);
+            }
+            let mut foreign = device("44"); foreign.mac_address = "other-host".into();
+            s.shared.update_device("other-adapter".into(), foreign);
+        }
+        sync.sync_bidirectional().unwrap();
+        sync.check_efi_changes().unwrap();
+        let s = state.lock().unwrap();
+        assert_eq!(s.local.len(), 5);
+        assert_eq!(s.local_writes, 5);
+        assert_eq!(s.activations, 1);
+        assert_eq!(s.shared_writes, 0);
+        assert!(!s.local.contains_key("other-host"));
+    }
+
+    #[test]
+    fn missing_bond_preview_and_efi_only_repair_do_not_write() {
+        let (mut sync, state) = setup(device("22"), device("11"));
+        { let mut s = state.lock().unwrap(); s.local.clear(); s.allow_missing = true; }
+        sync.preview_bidirectional().unwrap();
+        assert!(sync.repair_efi_only().is_err());
+        let s = state.lock().unwrap();
+        assert_eq!(s.local_writes, 0); assert_eq!(s.shared_writes, 0); assert_eq!(s.activations, 0);
+    }
+
+    #[test]
+    fn incomplete_missing_bond_does_not_block_other_devices_or_delete_shared_record() {
+        let (mut sync, state) = setup(device("22"), device("11"));
+        { let mut s = state.lock().unwrap(); s.local.clear(); s.allow_missing = true;
+          s.shared.update_device("adapter".into(), BluetoothDevice { mac_address: "incomplete".into(), classic: None, le: Some(LeKeys::default()) }); }
+        sync.sync_bidirectional().unwrap();
+        let s = state.lock().unwrap();
+        assert_eq!(s.local.len(), 1); assert_eq!(s.activations, 1);
+        assert!(s.shared.get_device("adapter", "incomplete").is_some());
+    }
+
+    #[test]
+    fn backend_without_bond_creation_keeps_missing_record_shared_only() {
+        let (mut sync, state) = setup(device("22"), device("11"));
+        state.lock().unwrap().local.clear();
+        sync.sync_bidirectional().unwrap();
+        let s = state.lock().unwrap(); assert!(s.local.is_empty()); assert_eq!(s.activations, 0);
     }
 
     #[test]

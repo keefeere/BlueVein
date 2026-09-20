@@ -249,6 +249,7 @@ impl WindowsBluetoothManager {
                 );
             } else {
                 le_keys.irk = Some(key);
+                le_keys.irk_encoding = Some("windows".into());
                 has_keys = true;
             }
         }
@@ -527,6 +528,16 @@ impl WindowsBluetoothManager {
 impl BluetoothManager for WindowsBluetoothManager {
     fn migrate_shared_config(&self, config: &mut crate::config::BlueVeinConfig) -> Result<(), Box<dyn Error>> {
         for adapter_mac in self.get_adapters()? {
+            // Registry reads establish the format of matching legacy IRKs.
+            for local in self.get_devices(&adapter_mac)? {
+                if let Some(shared) = config.adapters.get_mut(&adapter_mac).and_then(|a| a.devices.get_mut(&local.mac_address)) {
+                    if let (Some(a), Some(b)) = (&local.le, &mut shared.le) {
+                        if b.irk_encoding.is_none() && b.irk.is_some() && a.irk.as_ref().zip(b.irk.as_ref()).is_some_and(|(x,y)| x.eq_ignore_ascii_case(y)) {
+                            b.irk_encoding = Some("windows".into());
+                        }
+                    }
+                }
+            }
             let keys = self.open_bluetooth_keys()?;
             let adapter = keys.open_subkey_with_flags(mac_to_windows_format(&adapter_mac), KEY_READ)?;
             for (storage, identity, _) in Self::le_locations(&adapter)? {
@@ -721,6 +732,7 @@ fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
     }
     if let Some(le) = result.le.as_mut() {
         if let Some(irk) = le.irk.as_mut() { irk.make_ascii_uppercase(); }
+        le.irk_encoding = None;
         le.peripheral_ltk = None;
         if let Some(ltk) = le.ltk.as_mut() {
             ltk.key.make_ascii_uppercase();

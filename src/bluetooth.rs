@@ -69,6 +69,9 @@ pub struct LeKeys {
     pub peripheral_ltk: Option<LeLongTermKey>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub irk: Option<String>,
+    /// Explicit shared IRK representation. Legacy records omit this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub irk_encoding: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub csrk_local: Option<CsrkKey>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,7 +141,9 @@ impl BluetoothDevice {
 
     /// Check if device has any keys
     pub fn has_keys(&self) -> bool {
-        self.classic.is_some() || self.le.is_some()
+        self.classic.is_some() || self.le.as_ref().is_some_and(|le|
+            le.ltk.is_some() || le.peripheral_ltk.is_some() || le.irk.is_some()
+                || le.csrk_local.is_some() || le.csrk_remote.is_some())
     }
 
     /// Merge two devices, combining keys from both
@@ -161,6 +166,11 @@ impl BluetoothDevice {
             ltk: LeLongTermKey::merge_optional(&le1.ltk, &le2.ltk),
             peripheral_ltk: LeLongTermKey::merge_optional(&le1.peripheral_ltk, &le2.peripheral_ltk),
             irk: le2.irk.clone().or_else(|| le1.irk.clone()),
+            irk_encoding: if le2.irk.is_some() {
+                le2.irk_encoding.clone().or_else(|| {
+                    if le1.irk == le2.irk { le1.irk_encoding.clone() } else { None }
+                })
+            } else { le1.irk_encoding.clone() },
             csrk_local: le2.csrk_local.clone().or_else(|| le1.csrk_local.clone()),
             csrk_remote: le2.csrk_remote.clone().or_else(|| le1.csrk_remote.clone()),
             address_type: le2
@@ -207,6 +217,17 @@ pub fn validate_bluetooth_key(key: &str, key_name: &str) -> Result<(), Box<dyn E
 
 /// Trait for platform-specific Bluetooth management
 pub trait BluetoothManager: Send {
+    /// Missing OS bonds need platform-specific metadata; do not fabricate them.
+    fn import_missing_reason(&self, _device: &BluetoothDevice) -> Option<String> {
+        Some("this backend requires an existing OS bond".into())
+    }
+
+    /// Explain an unsafe or ambiguous update without blocking unrelated devices.
+    fn update_reason(&self, _current: &BluetoothDevice, _desired: &BluetoothDevice) -> Option<String> { None }
+
+    /// Apply an entire import batch once (no-op on registry backends).
+    fn apply_pending(&mut self) -> Result<(), Box<dyn Error>> { Ok(()) }
+
     /// Whether importing the desired record would change fields this backend stores.
     /// Unsupported cross-platform metadata must stay in EFI, not trigger endless writes.
     fn needs_update(&self, current: &BluetoothDevice, desired: &BluetoothDevice) -> bool {
@@ -288,6 +309,19 @@ pub fn is_valid_mac_hex(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn irk_encoding_tracks_its_key_and_is_not_inherited_after_rekey() {
+        let mut local = BluetoothDevice::le_with_ltk("peer".into(), LeLongTermKey { key: "11".repeat(16), authenticated: Some(2), enc_size: Some(16), ediv: Some(0), rand: Some(0) });
+        local.le.as_mut().unwrap().irk = Some("22".repeat(16));
+        local.le.as_mut().unwrap().irk_encoding = Some("windows".into());
+        let mut legacy = local.clone(); legacy.le.as_mut().unwrap().irk_encoding = None;
+        assert_eq!(local.merge_with(&legacy).le.unwrap().irk_encoding.as_deref(), Some("windows"));
+        legacy.le.as_mut().unwrap().irk = Some("33".repeat(16));
+        assert!(local.merge_with(&legacy).le.unwrap().irk_encoding.is_none());
+        let json = serde_json::to_string(&local).unwrap();
+        assert_eq!(serde_json::from_str::<BluetoothDevice>(&json).unwrap(), local);
+    }
 
     #[test]
     fn same_key_retains_sc_metadata_missing_from_older_exports() {

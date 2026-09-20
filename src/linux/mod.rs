@@ -16,6 +16,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         return Err("Requires root privileges".into());
     }
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        if args.len() != 1 || !matches!(args[0].as_str(), "--audit-sync" | "--sync-once") {
+            return Err("Usage: bluevein [--audit-sync|--sync-once]".into());
+        }
+        let efi_context = EfiContext::from_env();
+        efi_context.validate()?;
+        let mut sync = SyncManager::new(Box::new(bluetooth::LinuxBluetoothManager::new()?), efi_context);
+        return if args[0] == "--audit-sync" { sync.preview_bidirectional() } else { sync.sync_bidirectional() };
+    }
+
     // Create tokio runtime and run async code
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run_service())

@@ -1,15 +1,48 @@
 # Windows LE identity synchronization repair
 
-## Linux compatibility for an existing Windows-format IRK
+## General Linux bond import
 
-On the tested host, the shared iPhone IRK bytes resolve its advertised RPA only
-after reversal at the Linux storage boundary. A scoped Linux override is available:
-`BLUEVEIN_LINUX_REVERSE_IRK_PEERS=44:F7:9F:AC:CD:9C/10:A2:D3:01:47:A1`.
-Multiple adapter/peer pairs may be comma-separated. Invalid entries fail startup.
-The conversion applies symmetrically on Linux read and write, preserving the shared
-EFI representation and compatibility with the deployed Windows binary. It does
-not reverse LTKs or change unlisted bonds. This is an explicit compatibility
-setting, not automatic format detection or a global key-format migration.
+Linux now imports complete missing bonds for locally known adapters, including
+an adapter with no paired devices. There is no device-name or MAC allowlist.
+Windows still requires an existing OS bond: creating registry keys alone is not
+PnP device enrollment. Pair a new device once in Windows, then export it for Linux.
+
+New shared IRKs carry `irk_encoding: "windows"`. Both backends export this format;
+Linux reverses bytes at its BlueZ storage boundary, while Windows uses registry
+bytes directly. LTK bytes are unchanged. `random` in the shared record maps to
+BlueZ's on-disk `static`; public identities remain public.
+
+Unmarked legacy IRKs are tagged only when they match the current backend's
+canonical key. A different unmarked IRK is ambiguous and is reported without
+importing it. Run the updated Windows exporter to establish the format of old
+Windows records before Linux import. The former per-peer
+`BLUEVEIN_LINUX_REVERSE_IRK_PEERS` override is no longer read. Do not globally
+reverse old shared keys based on their device names or assume their origin.
+
+Missing LE bonds require a stable public/static identity, a complete LTK (key,
+authentication/type, encryption size, EDIV, Rand), and a known format for any IRK.
+Incomplete records are preserved in EFI and reported individually; they do not
+prevent other complete bonds from importing. IRK-only discovery records and
+transient private addresses are not manufactured into bonds. A record containing
+only address metadata is not exported as a bond.
+
+Linux stops Bluetooth once before writing an import batch, then starts it once
+afterwards, including on an import error. This prevents a running bluetoothd from
+flushing stale records over imported keys. Unchanged synchronization does not
+stop Bluetooth. Complete info files are published atomically with mode 0600;
+unrelated fields in existing records are retained. New imported bonds are trusted
+and declare their supported transports. No scanning or reconnect loop is added.
+
+`sudo bluevein --audit-sync` previews imports and migrations without writing keys
+or stopping Bluetooth. `sudo bluevein --sync-once` applies one batch. Normal service
+startup uses the same planner. Set `BLUEVEIN_EFI_DEVICE` as for the service.
+
+The automated suite covers several missing devices, empty adapters, incomplete
+records, foreign adapters, dry-run/EFI-only behavior, repeated synchronization,
+and real BlueZ file round trips with legacy and Secure Connections metadata.
+Physical input, reboot and cross-OS acceptance still require device testing.
+
+### Existing host privacy finding
 
 The same host required `Privacy=off` in BlueZ for its public controller identity
 to be recognized by the existing iPhone bond. With a reversed Linux IRK, original
