@@ -11,12 +11,37 @@ use winreg::RegKey;
 
 const BLUETOOTH_REG_PATH: &str = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys";
 const BLUETOOTH_LE_REG_PATH: &str = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys";
+const BLUETOOTH_DEVICE_REG_PATH: &str = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices";
 
 pub struct WindowsBluetoothManager {
     hklm: RegKey,
 }
 
 impl WindowsBluetoothManager {
+    /// Device display names are separate from BTHPORT pairing keys. A missing
+    /// cache entry must never prevent key synchronization.
+    fn read_device_name(&self, adapter_mac: &str, device_mac: &str) -> Option<String> {
+        let root = self.hklm.open_subkey_with_flags(BLUETOOTH_DEVICE_REG_PATH, KEY_READ).ok()?;
+        let identity = mac_to_windows_format(device_mac);
+        let mut candidates = vec![identity.clone()];
+        if let Ok(keys) = self.open_bluetooth_le_keys() {
+            if let Ok(adapter) = keys.open_subkey_with_flags(mac_to_windows_format(adapter_mac), KEY_READ) {
+                if let Ok(Some(storage)) = Self::le_storage_name(&adapter, device_mac) {
+                    if storage != identity { candidates.push(storage); }
+                }
+            }
+        }
+        for candidate in candidates {
+            if let Ok(record) = root.open_subkey_with_flags(candidate, KEY_READ) {
+                if let Ok(value) = record.get_raw_value("Name") {
+                    if let Some(name) = decode_cached_name(&value.bytes, value.vtype) {
+                        if crate::bluetooth::useful_device_name(&name, device_mac) { return Some(name); }
+                    }
+                }
+            }
+        }
+        None
+    }
     pub fn new() -> Result<Self, Box<dyn Error>> {
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
         Ok(Self { hklm })
@@ -618,6 +643,10 @@ impl BluetoothManager for WindowsBluetoothManager {
         result
     }
 
+    fn choose_shared_name(&self, local: &BluetoothDevice, shared: &BluetoothDevice) -> Option<String> {
+        local.name.clone().or_else(|| shared.name.clone())
+    }
+
     fn needs_update(&self, current: &BluetoothDevice, desired: &BluetoothDevice) -> bool {
         registry_projection(current) != registry_projection(desired)
     }
@@ -655,7 +684,8 @@ impl BluetoothManager for WindowsBluetoothManager {
             let classic = self.read_classic_device(adapter_mac, &mac)?;
             let le = self.read_le_device(adapter_mac, &mac)?;
             if classic.is_some() || le.is_some() {
-                devices.push(BluetoothDevice { mac_address: mac, classic, le });
+                let name = self.read_device_name(adapter_mac, &mac);
+                devices.push(BluetoothDevice { mac_address: mac, name, classic, le });
             }
         }
         if let Ok(filter) = std::env::var("BLUEVEIN_DEVICE_FILTER") {
@@ -678,6 +708,7 @@ impl BluetoothManager for WindowsBluetoothManager {
 
         Ok(BluetoothDevice {
             mac_address: normalize_mac(device_mac),
+            name: self.read_device_name(adapter_mac, device_mac),
             classic,
             le,
         })
@@ -732,10 +763,26 @@ fn windows_ltk_type(authenticated: Option<u8>, auth_req: Option<u32>, ediv: Opti
     (authenticated & 1) | if secure || authenticated & 2 != 0 { 2 } else { 0 }
 }
 
+fn decode_cached_name(bytes: &[u8], kind: RegType) -> Option<String> {
+    let utf16 = matches!(kind, RegType::REG_SZ | RegType::REG_EXPAND_SZ)
+        || (bytes.len() >= 4 && bytes.len() % 2 == 0
+            && bytes.chunks_exact(2).take(8).any(|pair| pair[1] == 0));
+    let name = if utf16 {
+        if bytes.len() % 2 != 0 { return None; }
+        let units: Vec<u16> = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        String::from_utf16(&units).ok()?
+    } else {
+        String::from_utf8(bytes.to_vec()).ok()?
+    };
+    let name = name.trim_matches('\0').trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// The values that survive a Windows registry write/read round trip.
 /// Do not alias peripheral_ltk to ltk: their role semantics are different.
 fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
     let mut result = device.clone();
+    result.name = None;
     if let Some(classic) = result.classic.as_mut() {
         classic.link_key.make_ascii_uppercase();
         classic.key_type = 4;
@@ -764,6 +811,13 @@ fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_name_decodes_binary_utf8_and_registry_utf16() {
+        assert_eq!(decode_cached_name(b"MX Keys\0", RegType::REG_BINARY).as_deref(), Some("MX Keys"));
+        let wide: Vec<u8> = "InpuDeck\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_cached_name(&wide, RegType::REG_SZ).as_deref(), Some("InpuDeck"));
+    }
 
     #[test]
     fn untagged_conflicting_irk_cannot_overwrite_live_windows_bond() {
@@ -963,7 +1017,7 @@ mod tests {
 
     #[test]
     fn iphone_irk_only_does_not_reimport_linux_metadata() {
-        let current = BluetoothDevice { mac_address: "AA:BB:CC:DD:EE:FF".into(),
+        let current = BluetoothDevice { mac_address: "AA:BB:CC:DD:EE:FF".into(), name: None,
             classic: None, le: Some(LeKeys { irk: Some("22".repeat(16)), ..Default::default() }) };
         let mut desired = current.clone();
         desired.le.as_mut().unwrap().peripheral_ltk = Some(key());

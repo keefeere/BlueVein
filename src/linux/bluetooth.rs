@@ -1,5 +1,5 @@
 use crate::bluetooth::{
-    normalize_mac, validate_bluetooth_key, BluetoothDevice, BluetoothManager, ClassicKeys, CsrkKey,
+    normalize_mac, useful_device_name, validate_bluetooth_key, BluetoothDevice, BluetoothManager, ClassicKeys, CsrkKey,
     LeKeys, LeLongTermKey,
 };
 use crate::log;
@@ -95,6 +95,7 @@ impl LinuxBluetoothManager {
 
         let mut device = BluetoothDevice {
             mac_address: normalize_mac(device_mac),
+            name: None,
             classic: None,
             le: None,
         };
@@ -262,6 +263,9 @@ impl LinuxBluetoothManager {
 
         // Parse AddressType from [General] section
         if let Some(general_section) = sections.get("General") {
+            device.name = general_section.get("Name")
+                .filter(|name| useful_device_name(name, device_mac))
+                .cloned();
             if let Some(addr_type) = general_section.get("AddressType") {
                 le_keys.address_type = Some(if addr_type == "static" { "random".into() } else { addr_type.clone() });
                 has_le = true;
@@ -350,6 +354,10 @@ impl LinuxBluetoothManager {
             general.insert("SupportedTechnologies".into(), match (device.classic.is_some(), device.le.is_some()) {
                 (true, true) => "BR/EDR;LE;", (true, false) => "BR/EDR;", _ => "LE;",
             }.into());
+        }
+        if let Some(name) = device.name.as_ref().filter(|name| useful_device_name(name, &device.mac_address)) {
+            let general = sections.entry("General".into()).or_insert_with(HashMap::new);
+            general.insert("Name".into(), name.clone());
         }
 
         // Update Classic LinkKey
@@ -504,6 +512,15 @@ impl LinuxBluetoothManager {
 }
 
 impl BluetoothManager for LinuxBluetoothManager {
+    fn needs_update(&self, current: &BluetoothDevice, desired: &BluetoothDevice) -> bool {
+        let mut current_keys = current.clone();
+        let mut desired_keys = desired.clone();
+        current_keys.name = None;
+        desired_keys.name = None;
+        current_keys != desired_keys ||
+            (desired.name.as_ref().is_some_and(|name| useful_device_name(name, &desired.mac_address))
+                && current.name != desired.name)
+    }
     fn migrate_shared_config(&self, config: &mut crate::config::BlueVeinConfig) -> Result<(), Box<dyn Error>> {
         // Tag only byte order already established by the local canonical key.
         // Never guess the origin of a different untagged shared IRK.
@@ -630,7 +647,7 @@ impl BluetoothManager for LinuxBluetoothManager {
 mod general_import_tests {
     use super::*;
     fn bond() -> BluetoothDevice {
-        BluetoothDevice { mac_address: "D0:11:22:33:44:55".into(), classic: None,
+        BluetoothDevice { mac_address: "D0:11:22:33:44:55".into(), name: None, classic: None,
             le: Some(LeKeys { address_type: Some("random".into()),
                 irk: Some("000102030405060708090A0B0C0D0E0F".into()), irk_encoding: Some("windows".into()),
                 ltk: Some(LeLongTermKey { key: "AA".repeat(16), authenticated: Some(2), enc_size: Some(16), ediv: Some(0), rand: Some(0) }),
@@ -658,6 +675,26 @@ mod general_import_tests {
             LinuxBluetoothManager::write_device_file(&path, &d).unwrap();
             assert!(fs::read_to_string(&path).unwrap().contains("Keep=value"));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_name_updates_bluez_name_without_erasing_local_alias() {
+        let root = std::env::temp_dir().join(format!("bluevein-name-{}", std::process::id()));
+        let path = root.join("info");
+        let mut device = bond();
+        device.name = Some("MX Keys".into());
+        LinuxBluetoothManager::write_device_file(&path, &device).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(LinuxBluetoothManager::parse_device_content(&content, &device.mac_address).unwrap().name, device.name);
+        fs::write(&path, content.replace("Name=MX Keys", "Name=Old MX\nAlias=Desk keyboard")).unwrap();
+        assert!(LinuxBluetoothManager::new().unwrap().needs_update(
+            &LinuxBluetoothManager::parse_device_content(&fs::read_to_string(&path).unwrap(), &device.mac_address).unwrap(),
+            &device));
+        LinuxBluetoothManager::write_device_file(&path, &device).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Name=MX Keys"));
+        assert!(content.contains("Alias=Desk keyboard"));
         fs::remove_dir_all(root).unwrap();
     }
 

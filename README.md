@@ -74,6 +74,14 @@ BlueVein keeps the pairing keys synchronized automatically. Reconnection still
 depends on the Bluetooth stack in each OS; a valid bond alone cannot repair a
 host-side connection bug.
 
+When Windows has a cached Bluetooth device name, BlueVein also carries it in
+the shared record. Linux uses it as the BlueZ `Name` while importing or updating
+the matching bond; an existing Linux `Alias` is preserved. Names are optional:
+older shared files and devices without a cached name remain valid. Historical
+bonds from Windows can still reappear in Linux because the shared device list
+is a union of both systems; BlueVein does not infer that a deletion in one OS
+should delete the pairing in the other.
+
 ## 🌟 Why BlueVein?
 
 <div align="center">

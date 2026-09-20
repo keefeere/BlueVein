@@ -207,7 +207,8 @@ impl SyncManager {
                             if let Some(system_device) = system_devices.get(device_mac) {
                                 // Device exists in both EFI and system
                                 // Merge to combine both Classic and LE keys if needed
-                                let merged = Self::merge_devices(system_device, efi_device);
+                                let mut merged = Self::merge_devices(system_device, efi_device);
+                                merged.name = self.bt_manager.choose_shared_name(system_device, efi_device);
 
                                 if let Some(reason) = self.bt_manager.update_reason(system_device, &merged) {
                                     log!("[BlueVein] Cannot update {}: {}", device_mac, reason);
@@ -620,7 +621,7 @@ mod tests {
     fn incomplete_missing_bond_does_not_block_other_devices_or_delete_shared_record() {
         let (mut sync, state) = setup(device("22"), device("11"));
         { let mut s = state.lock().unwrap(); s.local.clear(); s.allow_missing = true;
-          s.shared.update_device("adapter".into(), BluetoothDevice { mac_address: "incomplete".into(), classic: None, le: Some(LeKeys::default()) }); }
+          s.shared.update_device("adapter".into(), BluetoothDevice { mac_address: "incomplete".into(), name: None, classic: None, le: Some(LeKeys::default()) }); }
         sync.sync_bidirectional().unwrap();
         let s = state.lock().unwrap();
         assert_eq!(s.local.len(), 1); assert_eq!(s.activations, 1);
@@ -661,7 +662,7 @@ mod tests {
     fn startup_rejects_lost_shared_write() {
         let mut local = device("22");
         local.le.as_mut().unwrap().irk = Some("33".repeat(16));
-        let shared = BluetoothDevice { mac_address: "phone".into(), classic: None,
+        let shared = BluetoothDevice { mac_address: "phone".into(), name: None, classic: None,
             le: Some(LeKeys { irk: Some("33".repeat(16)), ..Default::default() }) };
         let (mut sync, state) = setup(local, shared);
         state.lock().unwrap().discard_shared_write = true;
@@ -754,7 +755,7 @@ mod tests {
     #[test]
     fn startup_exports_missing_ltk_for_existing_irk_only_shared_device() {
         let mut local = device("22"); local.le.as_mut().unwrap().irk = Some("33".repeat(16));
-        let shared = BluetoothDevice { mac_address: "phone".into(), classic: None,
+        let shared = BluetoothDevice { mac_address: "phone".into(), name: None, classic: None,
             le: Some(LeKeys { irk: Some("33".repeat(16)), ..Default::default() }) };
         let (mut sync, state) = setup(local.clone(), shared);
         sync.sync_bidirectional().unwrap();

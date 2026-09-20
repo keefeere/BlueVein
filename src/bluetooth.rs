@@ -109,6 +109,9 @@ impl ClassicKeys {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BluetoothDevice {
     pub mac_address: String,
+    /// Last useful device name observed by either operating system.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classic: Option<ClassicKeys>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,6 +124,7 @@ impl BluetoothDevice {
     pub fn classic(mac_address: String, link_key: String) -> Self {
         Self {
             mac_address,
+            name: None,
             classic: Some(ClassicKeys::new(link_key)),
             le: None,
         }
@@ -131,6 +135,7 @@ impl BluetoothDevice {
     pub fn le_with_ltk(mac_address: String, ltk: LeLongTermKey) -> Self {
         Self {
             mac_address,
+            name: None,
             classic: None,
             le: Some(LeKeys {
                 ltk: Some(ltk),
@@ -151,6 +156,7 @@ impl BluetoothDevice {
     pub fn merge_with(&self, other: &BluetoothDevice) -> BluetoothDevice {
         BluetoothDevice {
             mac_address: self.mac_address.clone(),
+            name: other.name.clone().or_else(|| self.name.clone()),
             classic: other.classic.clone().or_else(|| self.classic.clone()),
             le: match (&self.le, &other.le) {
                 (Some(le1), Some(le2)) => Some(Self::merge_le_keys(le1, le2)),
@@ -178,6 +184,29 @@ impl BluetoothDevice {
                 .clone()
                 .or_else(|| le1.address_type.clone()),
         }
+    }
+}
+
+/// Reject address placeholders and values that cannot be stored safely in BlueZ's INI file.
+pub fn useful_device_name(name: &str, mac: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty() && name.len() <= 248 && !name.chars().any(char::is_control)
+        && !name.eq_ignore_ascii_case(mac)
+        && !name.replace([':', '-'].as_slice(), "").eq_ignore_ascii_case(&mac.replace([':', '-'].as_slice(), ""))
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn old_shared_records_and_address_placeholders_are_safe() {
+        let old = r#"{"mac_address":"AA:BB:CC:DD:EE:FF","classic":null,"le":null}"#;
+        let device: BluetoothDevice = serde_json::from_str(old).unwrap();
+        assert_eq!(device.name, None);
+        assert!(!useful_device_name("AA-BB-CC-DD-EE-FF", &device.mac_address));
+        assert!(!useful_device_name("bad\nname", &device.mac_address));
+        assert!(useful_device_name("MX Keys", &device.mac_address));
     }
 }
 
@@ -217,6 +246,10 @@ pub fn validate_bluetooth_key(key: &str, key_name: &str) -> Result<(), Box<dyn E
 
 /// Trait for platform-specific Bluetooth management
 pub trait BluetoothManager: Send {
+    /// Shared name wins by default; backends with a direct OS name source can override.
+    fn choose_shared_name(&self, local: &BluetoothDevice, shared: &BluetoothDevice) -> Option<String> {
+        shared.name.clone().or_else(|| local.name.clone())
+    }
     /// Missing OS bonds need platform-specific metadata; do not fabricate them.
     fn import_missing_reason(&self, _device: &BluetoothDevice) -> Option<String> {
         Some("this backend requires an existing OS bond".into())
