@@ -1,5 +1,28 @@
 # Windows LE identity synchronization repair
 
+## Pairing removal protocol (candidate, 2026-09-20)
+
+A local bond absent at startup is not treated as deleted. The live monitor must
+first have observed it after a successful synchronization, then observe its
+removal. Windows waits for three seconds of continuous absence; Linux confirms
+the device directory remains absent after two seconds. The EFI record keeps a
+pending-deletion marker with the source OS and SHA-256 fingerprints of the
+observed bonding keys; the fingerprints are never logged. The source OS does
+not reimport that record.
+
+On the other OS, the sync removes the local pairing through the OS Bluetooth
+API only when its bonding keys match the marker. Linux asks BlueZ `RemoveDevice`
+over D-Bus; Windows calls `BluetoothRemoveDevice`. After confirming the local
+record is gone, BlueVein removes the EFI record. If the local record was already
+absent, it only clears EFI. A different complete bond at the same address wins
+over the old marker; an uncomparable record or failed unpair leaves the marker
+for diagnosis. `audit-sync` previews the removal without changing either OS.
+
+Both OS binaries must be updated before relying on this protocol. An older
+binary can ignore the new marker. The automated tests cover the state machine,
+but physical unpair behavior on the dual-boot host is not yet verified; do not
+use a working InpuDeck/MX bond as the first live deletion test.
+
 ## General Linux bond import
 
 Linux now imports complete missing bonds for locally known adapters, including
