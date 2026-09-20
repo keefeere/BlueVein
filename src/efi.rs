@@ -311,3 +311,20 @@ pub fn write_config_with_device(
 
     Ok(())
 }
+
+/// Injectable shared store: tests exercise synchronization without touching disks.
+pub trait ConfigStore: Send {
+    fn read(&self) -> Result<BlueVeinConfig, EfiError>;
+    fn write(&mut self, config: &BlueVeinConfig) -> Result<(), EfiError>;
+    fn display_name(&self) -> &str;
+}
+
+impl ConfigStore for EfiContext {
+    fn read(&self) -> Result<BlueVeinConfig, EfiError> {
+        read_config_with_device(Some(&self.device))
+    }
+    fn write(&mut self, config: &BlueVeinConfig) -> Result<(), EfiError> {
+        write_config_with_device(config, Some(&self.device))
+    }
+    fn display_name(&self) -> &str { EfiContext::display_name(self) }
+}

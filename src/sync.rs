@@ -1,6 +1,6 @@
 use crate::bluetooth::{BluetoothDevice, BluetoothManager, CsrkKey};
 use crate::config::BlueVeinConfig;
-use crate::efi::{self, EfiContext};
+use crate::efi::{self, ConfigStore, EfiContext};
 use crate::log;
 use std::collections::HashMap;
 use std::error::Error;
@@ -8,7 +8,7 @@ use std::error::Error;
 /// Synchronization manager
 pub struct SyncManager {
     bt_manager: Box<dyn BluetoothManager>,
-    efi_context: EfiContext,
+    store: Box<dyn ConfigStore>,
 }
 
 impl SyncManager {
@@ -16,7 +16,7 @@ impl SyncManager {
     pub fn new(bt_manager: Box<dyn BluetoothManager>, efi_context: EfiContext) -> Self {
         Self {
             bt_manager,
-            efi_context,
+            store: Box::new(efi_context),
         }
     }
 
@@ -25,7 +25,7 @@ impl SyncManager {
     pub fn with_default_efi(bt_manager: Box<dyn BluetoothManager>) -> Self {
         Self {
             bt_manager,
-            efi_context: EfiContext::default(),
+            store: Box::new(EfiContext::default()),
         }
     }
 
@@ -123,11 +123,11 @@ impl SyncManager {
     pub fn sync_bidirectional(&mut self) -> Result<(), Box<dyn Error>> {
         log!(
             "[BlueVein] Starting bidirectional synchronization (EFI device: {})...",
-            self.efi_context.display_name()
+            self.store.display_name()
         );
 
         // Read config from EFI (may not exist)
-        let efi_config = match efi::read_config_with_device(Some(&self.efi_context.device)) {
+        let efi_config = match self.store.read() {
             Ok(config) => {
                 log!("[BlueVein] Found existing EFI config");
                 Some(config)
@@ -179,12 +179,14 @@ impl SyncManager {
             }
         }
 
+        let original_config = efi_config.clone();
         // Merge strategy: Update existing devices from EFI, add new system devices to EFI
         let final_config = if let Some(mut efi_cfg) = efi_config {
             log!("[BlueVein] Merging EFI config with system state");
 
             // Step 1: Apply EFI keys to existing system devices
             for adapter_mac in &adapters {
+                let mut merged_devices = Vec::new();
                 if let Some(efi_devices) = efi_cfg.get_adapter_devices(adapter_mac) {
                     if let Some(system_devices) = system_config.get_adapter_devices(adapter_mac) {
                         log!("[BlueVein] Processing adapter {}", adapter_mac);
@@ -195,6 +197,7 @@ impl SyncManager {
                                 // Merge to combine both Classic and LE keys if needed
                                 let merged = Self::merge_devices(system_device, efi_device);
 
+                                merged_devices.push(merged.clone());
                                 if self.bt_manager.needs_update(system_device, &merged) {
                                     // Keys differ or missing - update from merged result
                                     log!(
@@ -227,6 +230,9 @@ impl SyncManager {
                     }
                 }
 
+                for device in merged_devices {
+                    efi_cfg.update_device(adapter_mac.clone(), device);
+                }
                 // Step 2: Add system devices that are not in EFI
                 if let Some(system_devices) = system_config.get_adapter_devices(adapter_mac) {
                     // Collect devices to add (to avoid borrow conflict)
@@ -264,11 +270,15 @@ impl SyncManager {
             system_config
         };
 
+        if original_config.as_ref() == Some(&final_config) {
+            log!("[BlueVein] Shared config unchanged; skipping EFI write");
+            return Ok(());
+        }
         // Write merged config back to EFI
-        match efi::write_config_with_device(&final_config, Some(&self.efi_context.device)) {
+        match self.store.write(&final_config) {
             Ok(_) => log!(
                 "[BlueVein] Successfully wrote merged config to EFI (device: {})",
-                self.efi_context.display_name()
+                self.store.display_name()
             ),
             Err(e) => {
                 log!("[BlueVein] Error writing config to EFI: {}", e);
@@ -287,7 +297,7 @@ impl SyncManager {
         log!("[BlueVein] Starting synchronization from EFI...");
 
         // Read config from EFI
-        let config = match efi::read_config_with_device(Some(&self.efi_context.device)) {
+        let config = match self.store.read() {
             Ok(config) => config,
             Err(efi::EfiError::NotFound) => {
                 log!("[BlueVein] No existing config found on EFI, will create on first change");
@@ -332,7 +342,7 @@ impl SyncManager {
         log!("[BlueVein] Syncing current state to EFI...");
 
         // Read existing config from EFI (or create empty)
-        let mut config = match efi::read_config_with_device(Some(&self.efi_context.device)) {
+        let mut config = match self.store.read() {
             Ok(config) => config,
             Err(efi::EfiError::NotFound) => BlueVeinConfig::new(),
             Err(e) => return Err(Box::new(e)),
@@ -362,10 +372,10 @@ impl SyncManager {
         }
 
         // Write config to EFI
-        efi::write_config_with_device(&config, Some(&self.efi_context.device))?;
+        self.store.write(&config)?;
         log!(
             "[BlueVein] Successfully synced to EFI (device: {})",
-            self.efi_context.display_name()
+            self.store.display_name()
         );
 
         Ok(())
@@ -407,7 +417,7 @@ impl SyncManager {
 
         log!("[BlueVein] Reading existing EFI config...");
         // Read existing config
-        let mut config = match efi::read_config_with_device(Some(&self.efi_context.device)) {
+        let mut config = match self.store.read() {
             Ok(config) => {
                 log!("[BlueVein] Found existing EFI config");
                 config
@@ -440,17 +450,17 @@ impl SyncManager {
 
         log!("[BlueVein] Writing updated config to EFI...");
         // Write back to EFI
-        match efi::write_config_with_device(&config, Some(&self.efi_context.device)) {
+        match self.store.write(&config) {
             Ok(_) => {
                 log!(
                     "[BlueVein] ✓ Successfully updated EFI config for device {} (device: {})",
                     device_mac,
-                    self.efi_context.display_name()
+                    self.store.display_name()
                 );
 
                 // Verify write
                 if let Ok(verify_config) =
-                    efi::read_config_with_device(Some(&self.efi_context.device))
+                    self.store.read()
                 {
                     if let Some(stored_device) =
                         verify_config.get_device(adapter_mac, &device.mac_address)
@@ -512,7 +522,7 @@ impl SyncManager {
     #[allow(dead_code)]
     pub fn check_efi_changes(&mut self) -> Result<(), Box<dyn Error>> {
         // Read config from EFI
-        let config = match efi::read_config_with_device(Some(&self.efi_context.device)) {
+        let config = match self.store.read() {
             Ok(config) => config,
             Err(efi::EfiError::NotFound) => {
                 return Ok(());
@@ -553,5 +563,109 @@ impl SyncManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bluetooth::{LeKeys, LeLongTermKey};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct State {
+        local: HashMap<String, BluetoothDevice>,
+        shared: BlueVeinConfig,
+        local_writes: usize,
+        shared_writes: usize,
+    }
+    struct Backend(Arc<Mutex<State>>);
+    impl BluetoothManager for Backend {
+        fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>> { Ok(vec!["adapter".into()]) }
+        fn get_devices(&self, _: &str) -> Result<Vec<BluetoothDevice>, Box<dyn Error>> {
+            Ok(self.0.lock().unwrap().local.values().cloned().collect())
+        }
+        fn get_device(&self, _: &str, mac: &str) -> Result<BluetoothDevice, Box<dyn Error>> {
+            self.0.lock().unwrap().local.get(mac).cloned().ok_or_else(|| "missing".into())
+        }
+        fn set_device(&mut self, _: &str, device: &BluetoothDevice) -> Result<(), Box<dyn Error>> {
+            let mut state = self.0.lock().unwrap();
+            state.local.insert(device.mac_address.clone(), device.clone());
+            state.local_writes += 1;
+            Ok(())
+        }
+        fn remove_device(&mut self, _: &str, _: &str) -> Result<(), Box<dyn Error>> { Ok(()) }
+    }
+    struct Store(Arc<Mutex<State>>);
+    impl ConfigStore for Store {
+        fn read(&self) -> Result<BlueVeinConfig, efi::EfiError> { Ok(self.0.lock().unwrap().shared.clone()) }
+        fn write(&mut self, config: &BlueVeinConfig) -> Result<(), efi::EfiError> {
+            let mut state = self.0.lock().unwrap(); state.shared = config.clone(); state.shared_writes += 1; Ok(())
+        }
+        fn display_name(&self) -> &str { "test memory" }
+    }
+    fn device(key: &str) -> BluetoothDevice {
+        BluetoothDevice::le_with_ltk("phone".into(), LeLongTermKey {
+            key: key.repeat(16), authenticated: Some(1), enc_size: Some(16), ediv: Some(0), rand: Some(0),
+        })
+    }
+    fn setup(local: BluetoothDevice, shared: BluetoothDevice) -> (SyncManager, Arc<Mutex<State>>) {
+        let mut state = State::default();
+        state.local.insert(local.mac_address.clone(), local);
+        state.shared.update_device("adapter".into(), shared);
+        let state = Arc::new(Mutex::new(state));
+        (SyncManager { bt_manager: Box::new(Backend(state.clone())), store: Box::new(Store(state.clone())) }, state)
+    }
+
+    #[test]
+    fn unchanged_startup_and_notifications_do_not_write_efi() {
+        let (mut sync, state) = setup(device("11"), device("11"));
+        sync.sync_bidirectional().unwrap();
+        sync.handle_device_change("adapter", "phone").unwrap();
+        sync.check_efi_changes().unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.shared_writes, 0);
+        assert_eq!(state.local_writes, 0);
+    }
+
+    #[test]
+    fn local_rekey_is_exported_and_is_not_reverted_by_next_import() {
+        let (mut sync, state) = setup(device("22"), device("11"));
+        sync.handle_device_change("adapter", "phone").unwrap();
+        sync.check_efi_changes().unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.shared.get_device("adapter", "phone"), Some(&device("22")));
+        assert_eq!(state.local_writes, 0);
+        assert_eq!(state.shared_writes, 1);
+    }
+
+    #[test]
+    fn local_export_preserves_other_platform_fields_and_other_devices() {
+        let mut shared = device("11");
+        shared.le.as_mut().unwrap().peripheral_ltk = shared.le.as_ref().unwrap().ltk.clone();
+        shared.le.as_mut().unwrap().address_type = Some("public".into());
+        let (mut sync, state) = setup(device("22"), shared.clone());
+        let mut other = device("33"); other.mac_address = "headphones".into();
+        state.lock().unwrap().shared.update_device("adapter".into(), other.clone());
+        sync.handle_device_change("adapter", "phone").unwrap();
+        let state = state.lock().unwrap();
+        let exported = state.shared.get_device("adapter", "phone").unwrap().le.as_ref().unwrap();
+        assert_eq!(exported.ltk, device("22").le.unwrap().ltk);
+        assert_eq!(exported.peripheral_ltk, shared.le.unwrap().peripheral_ltk);
+        assert_eq!(exported.address_type.as_deref(), Some("public"));
+        assert_eq!(state.shared.get_device("adapter", "headphones"), Some(&other));
+    }
+
+    #[test]
+    fn startup_exports_missing_ltk_for_existing_irk_only_shared_device() {
+        let mut local = device("22"); local.le.as_mut().unwrap().irk = Some("33".repeat(16));
+        let shared = BluetoothDevice { mac_address: "phone".into(), classic: None,
+            le: Some(LeKeys { irk: Some("33".repeat(16)), ..Default::default() }) };
+        let (mut sync, state) = setup(local.clone(), shared);
+        sync.sync_bidirectional().unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.shared.get_device("adapter", "phone"), Some(&local));
+        assert_eq!(state.shared_writes, 1);
+        assert_eq!(state.local_writes, 0);
     }
 }
