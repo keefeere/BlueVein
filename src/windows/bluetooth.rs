@@ -598,16 +598,20 @@ impl BluetoothManager for WindowsBluetoothManager {
 fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
     let mut result = device.clone();
     if let Some(classic) = result.classic.as_mut() {
+        classic.link_key.make_ascii_uppercase();
         classic.key_type = 4;
         classic.pin_length = 0;
     }
     if let Some(le) = result.le.as_mut() {
+        if let Some(irk) = le.irk.as_mut() { irk.make_ascii_uppercase(); }
         le.peripheral_ltk = None;
         le.address_type = None;
         if let Some(ltk) = le.ltk.as_mut() {
+            ltk.key.make_ascii_uppercase();
             ltk.authenticated = Some(ltk.authenticated_or_default());
         }
         for csrk in [&mut le.csrk_local, &mut le.csrk_remote].into_iter().flatten() {
+            csrk.key.make_ascii_uppercase();
             csrk.counter = 0;
             csrk.authenticated = false;
         }
@@ -644,6 +648,15 @@ mod tests {
         assert_eq!(manager.get_devices(adapter).unwrap().len(), 1);
         drop(manager);
         hkcu.delete_subkey_all(&root).unwrap();
+    }
+    #[test]
+    fn hexadecimal_case_is_not_a_key_change() {
+        let mut lower = BluetoothDevice::le_with_ltk("AA:BB:CC:DD:EE:FF".into(), key());
+        let le = lower.le.as_mut().unwrap();
+        le.ltk.as_mut().unwrap().key = "ab".repeat(16);
+        le.irk = Some("cd".repeat(16));
+        let upper = registry_projection(&lower);
+        assert_eq!(registry_projection(&lower), registry_projection(&upper));
     }
     fn key() -> LeLongTermKey {
         LeLongTermKey { key: "11".repeat(16), authenticated: Some(1),
