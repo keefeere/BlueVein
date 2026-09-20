@@ -2,6 +2,7 @@ name: Bluetooth sync regression tests
 on:
   push:
     branches: [codex/windows-le-sync]
+  pull_request:
   workflow_dispatch:
 permissions:
   contents: read

@@ -29,15 +29,14 @@ impl SyncManager {
         }
     }
 
-    /// Compare two devices to see if their keys differ
-    fn devices_differ(dev1: &BluetoothDevice, dev2: &BluetoothDevice) -> bool {
-        if dev1.classic != dev2.classic {
-            return true;
+    /// A successful write must be readable and preserve the complete shared state.
+    /// Never log the configuration: it contains pairing secrets.
+    fn write_verified(&mut self, config: &BlueVeinConfig) -> Result<(), Box<dyn Error>> {
+        self.store.write(config)?;
+        if self.store.read()? != *config {
+            return Err("EFI read-back does not match the exported configuration".into());
         }
-        if dev1.le != dev2.le {
-            return true;
-        }
-        false
+        Ok(())
     }
 
     /// Merge two devices, combining keys from both sources
@@ -295,14 +294,14 @@ impl SyncManager {
             return Ok(());
         }
         // Write merged config back to EFI
-        match self.store.write(&final_config) {
+        match self.write_verified(&final_config) {
             Ok(_) => log!(
                 "[BlueVein] Successfully wrote merged config to EFI (device: {})",
                 self.store.display_name()
             ),
             Err(e) => {
                 log!("[BlueVein] Error writing config to EFI: {}", e);
-                return Err(Box::new(e));
+                return Err(e);
             }
         }
 
@@ -392,7 +391,7 @@ impl SyncManager {
         }
 
         // Write config to EFI
-        self.store.write(&config)?;
+        self.write_verified(&config)?;
         log!(
             "[BlueVein] Successfully synced to EFI (device: {})",
             self.store.display_name()
@@ -470,7 +469,7 @@ impl SyncManager {
 
         log!("[BlueVein] Writing updated config to EFI...");
         // Write back to EFI
-        match self.store.write(&config) {
+        match self.write_verified(&config) {
             Ok(_) => {
                 log!(
                     "[BlueVein] ✓ Successfully updated EFI config for device {} (device: {})",
@@ -478,33 +477,11 @@ impl SyncManager {
                     self.store.display_name()
                 );
 
-                // Verify write
-                if let Ok(verify_config) =
-                    self.store.read()
-                {
-                    if let Some(stored_device) =
-                        verify_config.get_device(adapter_mac, &device.mac_address)
-                    {
-                        log!(
-                            "[BlueVein] ✓ Verified: Device {} is in EFI config",
-                            device_mac
-                        );
-                        if Self::devices_differ(&device, stored_device) {
-                            log!("[BlueVein] ✗ Warning: Device keys differ after write!");
-                        }
-                    } else {
-                        log!(
-                            "[BlueVein] ✗ Warning: Device {} NOT found in EFI config after write!",
-                            device_mac
-                        );
-                    }
-                }
-
                 Ok(())
             }
             Err(e) => {
                 log!("[BlueVein] ✗ Failed to write EFI config: {}", e);
-                Err(Box::new(e))
+                Err(e)
             }
         }
     }
@@ -600,6 +577,8 @@ mod tests {
         shared_writes: usize,
         fail_local_read: bool,
         fail_local_write: bool,
+        discard_shared_write: bool,
+        fail_read_after_write: bool,
     }
     struct Backend(Arc<Mutex<State>>);
     impl BluetoothManager for Backend {
@@ -623,9 +602,18 @@ mod tests {
     }
     struct Store(Arc<Mutex<State>>);
     impl ConfigStore for Store {
-        fn read(&self) -> Result<BlueVeinConfig, efi::EfiError> { Ok(self.0.lock().unwrap().shared.clone()) }
+        fn read(&self) -> Result<BlueVeinConfig, efi::EfiError> {
+            let state = self.0.lock().unwrap();
+            if state.fail_read_after_write && state.shared_writes > 0 {
+                return Err(efi::EfiError::ReadError("simulated verification read failure".into()));
+            }
+            Ok(state.shared.clone())
+        }
         fn write(&mut self, config: &BlueVeinConfig) -> Result<(), efi::EfiError> {
-            let mut state = self.0.lock().unwrap(); state.shared = config.clone(); state.shared_writes += 1; Ok(())
+            let mut state = self.0.lock().unwrap();
+            if !state.discard_shared_write { state.shared = config.clone(); }
+            state.shared_writes += 1;
+            Ok(())
         }
         fn display_name(&self) -> &str { "test memory" }
     }
@@ -640,6 +628,40 @@ mod tests {
         state.shared.update_device("adapter".into(), shared);
         let state = Arc::new(Mutex::new(state));
         (SyncManager { bt_manager: Box::new(Backend(state.clone())), store: Box::new(Store(state.clone())) }, state)
+    }
+
+    #[test]
+    fn lost_efi_export_fails_and_can_be_retried_before_import() {
+        let (mut sync, state) = setup(device("22"), device("11"));
+        state.lock().unwrap().discard_shared_write = true;
+        assert!(sync.handle_device_change("adapter", "phone").is_err());
+        assert_eq!(state.lock().unwrap().local_writes, 0);
+        state.lock().unwrap().discard_shared_write = false;
+        sync.handle_device_change("adapter", "phone").unwrap();
+        sync.check_efi_changes().unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.local_writes, 0);
+        assert_eq!(state.shared.get_device("adapter", "phone"), Some(&device("22")));
+    }
+
+    #[test]
+    fn unreadable_efi_after_export_is_an_error() {
+        let (mut sync, state) = setup(device("22"), device("11"));
+        state.lock().unwrap().fail_read_after_write = true;
+        assert!(sync.handle_device_change("adapter", "phone").is_err());
+        assert_eq!(state.lock().unwrap().local_writes, 0);
+    }
+
+    #[test]
+    fn startup_rejects_lost_shared_write() {
+        let mut local = device("22");
+        local.le.as_mut().unwrap().irk = Some("33".repeat(16));
+        let shared = BluetoothDevice { mac_address: "phone".into(), classic: None,
+            le: Some(LeKeys { irk: Some("33".repeat(16)), ..Default::default() }) };
+        let (mut sync, state) = setup(local, shared);
+        state.lock().unwrap().discard_shared_write = true;
+        assert!(sync.sync_bidirectional().is_err());
+        assert_eq!(state.lock().unwrap().local_writes, 0);
     }
 
     #[test]

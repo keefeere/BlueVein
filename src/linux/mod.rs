@@ -31,9 +31,7 @@ async fn run_service() -> Result<(), Box<dyn Error>> {
 
     log!("[BlueVein] Performing initial bidirectional sync...");
     // Use bidirectional sync to properly merge EFI and system state
-    if let Err(e) = sync_manager.sync_bidirectional() {
-        log!("[BlueVein] Warning: Initial sync failed: {}", e);
-    }
+    sync_manager.sync_bidirectional()?;
 
     // Start monitoring Bluetooth changes
     log!("[BlueVein] Starting Bluetooth monitoring...");
