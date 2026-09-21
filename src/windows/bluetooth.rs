@@ -12,6 +12,15 @@ use winreg::RegKey;
 const BLUETOOTH_REG_PATH: &str = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys";
 const BLUETOOTH_LE_REG_PATH: &str = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys";
 const BLUETOOTH_DEVICE_REG_PATH: &str = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices";
+/// PnP enumerators that hold the friendly name Windows itself displays.
+/// BTHLE first: its records belong to one peer, while BTHENUM also lists
+/// per-service nodes whose names describe a profile rather than the device.
+const PNP_ENUM_PATHS: [&str; 2] = [
+    r"SYSTEM\CurrentControlSet\Enum\BTHLE",
+    r"SYSTEM\CurrentControlSet\Enum\BTHENUM",
+];
+/// ERROR_NOT_FOUND: the Bluetooth stack has no device object for this address.
+const ERROR_NOT_FOUND: u32 = 1168;
 
 pub struct WindowsBluetoothManager {
     hklm: RegKey,
@@ -21,7 +30,6 @@ impl WindowsBluetoothManager {
     /// Device display names are separate from BTHPORT pairing keys. A missing
     /// cache entry must never prevent key synchronization.
     fn read_device_name(&self, adapter_mac: &str, device_mac: &str) -> Option<String> {
-        let root = self.hklm.open_subkey_with_flags(BLUETOOTH_DEVICE_REG_PATH, KEY_READ).ok()?;
         let identity = mac_to_windows_format(device_mac);
         let mut candidates = vec![identity.clone()];
         if let Ok(keys) = self.open_bluetooth_le_keys() {
@@ -31,12 +39,41 @@ impl WindowsBluetoothManager {
                 }
             }
         }
-        for candidate in candidates {
-            if let Ok(record) = root.open_subkey_with_flags(candidate, KEY_READ) {
-                if let Ok(value) = record.get_raw_value("Name") {
-                    if let Some(name) = decode_cached_name(&value.bytes, value.vtype) {
-                        if crate::bluetooth::useful_device_name(&name, device_mac) { return Some(name); }
+        if let Ok(root) = self.hklm.open_subkey_with_flags(BLUETOOTH_DEVICE_REG_PATH, KEY_READ) {
+            for candidate in candidates {
+                if let Ok(record) = root.open_subkey_with_flags(candidate, KEY_READ) {
+                    if let Ok(value) = record.get_raw_value("Name") {
+                        if let Some(name) = decode_cached_name(&value.bytes, value.vtype) {
+                            if crate::bluetooth::useful_device_name(&name, device_mac) { return Some(name); }
+                        }
                     }
+                }
+            }
+        }
+        self.read_pnp_name(device_mac)
+    }
+
+    /// BTHPORT caches a name only for peers that reported one while paired, so
+    /// an old LE bond can have keys and no cached name. PnP still holds the
+    /// friendly name Windows displays, and reading it changes no pairing state.
+    /// Only device containers are read: per-service nodes name a profile.
+    fn read_pnp_name(&self, device_mac: &str) -> Option<String> {
+        let identity = mac_to_windows_format(device_mac);
+        for path in PNP_ENUM_PATHS {
+            let Ok(root) = self.hklm.open_subkey_with_flags(path, KEY_READ) else { continue; };
+            let mut containers: Vec<String> = root.enum_keys().flatten()
+                .filter(|device_id| device_id.to_ascii_uppercase().contains(&identity))
+                .collect();
+            containers.sort();
+            for device_id in containers {
+                let Ok(container) = root.open_subkey_with_flags(&device_id, KEY_READ) else { continue; };
+                let mut instances: Vec<String> = container.enum_keys().flatten().collect();
+                instances.sort();
+                for instance in instances {
+                    let Ok(node) = container.open_subkey_with_flags(&instance, KEY_READ) else { continue; };
+                    let Ok(name) = node.get_value::<String, _>("FriendlyName") else { continue; };
+                    let name = name.trim_end_matches('\0').trim().to_string();
+                    if crate::bluetooth::useful_device_name(&name, device_mac) { return Some(name); }
                 }
             }
         }
@@ -548,6 +585,30 @@ impl WindowsBluetoothManager {
 
         Ok(())
     }
+
+    /// Delete the BTHPORT key material this backend reads for one peer. Called
+    /// only after the unpair API removed the device, or never knew it: the keys
+    /// are what would otherwise resurrect the bond on the next synchronization.
+    fn purge_registry_bond(&self, adapter_mac: &str, device_mac: &str) -> Result<(), Box<dyn Error>> {
+        let keys = self.open_bluetooth_keys()?;
+        let adapter = match keys.open_subkey_with_flags(mac_to_windows_format(adapter_mac), KEY_ALL_ACCESS) {
+            Ok(key) => key,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        match adapter.delete_value(mac_to_windows_format(device_mac)) {
+            Ok(()) => log!("[BlueVein] Removed leftover Classic registry bond for {}", device_mac),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let identity = normalize_mac(device_mac);
+        for (storage, peer, _) in Self::le_locations(&adapter)? {
+            if peer != identity { continue; }
+            adapter.delete_subkey_all(&storage)?;
+            log!("[BlueVein] Removed leftover LE registry bond of {} stored as {}", device_mac, storage);
+        }
+        Ok(())
+    }
 }
 
 impl BluetoothManager for WindowsBluetoothManager {
@@ -735,7 +796,6 @@ impl BluetoothManager for WindowsBluetoothManager {
     }
 
     fn remove_device(&mut self, adapter_mac: &str, device_mac: &str) -> Result<(), Box<dyn Error>> {
-        let _ = adapter_mac;
         // Use the Windows unpair API so PnP state and cached services are
         // removed along with keys. Registry deletion alone is not an unpair.
         let address = u64::from_str_radix(&mac_to_windows_format(device_mac), 16)?;
@@ -744,8 +804,20 @@ impl BluetoothManager for WindowsBluetoothManager {
             fn BluetoothRemoveDevice(address: *const u64) -> u32;
         }
         let result = unsafe { BluetoothRemoveDevice(&address) };
-        if result != 0 { return Err(format!("Windows could not unpair {} (error {})", device_mac, result).into()); }
-        Ok(())
+        match result {
+            0 => {}
+            // The stack has no device object, yet BlueVein reads this bond from
+            // BTHPORT. Only the stale key material is left to remove; failing
+            // here would keep re-importing a pairing that Windows already lost.
+            ERROR_NOT_FOUND => log!(
+                "[BlueVein] Windows has no paired device object for {}; removing its leftover registry bond",
+                device_mac
+            ),
+            error => {
+                return Err(format!("Windows could not unpair {} (error {})", device_mac, error).into())
+            }
+        }
+        self.purge_registry_bond(adapter_mac, device_mac)
     }
 }
 
@@ -918,6 +990,54 @@ mod tests {
         let adapter = keys.open_subkey("001122334455").unwrap();
         assert_eq!(adapter.open_subkey("412233445566").unwrap().get_raw_value("LTK").unwrap().bytes, vec![0x33; 16]);
         assert!(adapter.open_subkey("123456789abc").unwrap().get_raw_value("LTK").is_err());
+        drop(manager);
+        hkcu.delete_subkey_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pnp_friendly_name_fills_a_bond_without_a_bthport_cache_entry() {
+        let (hkcu, root, manager) = identity_fixture("pnp-name");
+        assert!(manager.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap().name.is_none());
+        let (container, _) = manager.hklm
+            .create_subkey(r"SYSTEM\CurrentControlSet\Enum\BTHLE\Dev_123456789ABC").unwrap();
+        let (node, _) = container.create_subkey("9&35dc57f9&0&123456789ABC").unwrap();
+        node.set_value("FriendlyName", &"IINE GAMEPAD").unwrap();
+        // A per-service node must not outrank the device container's own name.
+        let (service, _) = manager.hklm
+            .create_subkey(r"SYSTEM\CurrentControlSet\Enum\BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_LOCALMFG&0000").unwrap();
+        let (service_node, _) = service.create_subkey("7&1a2b3c&0&123456789ABC_C00000000").unwrap();
+        service_node.set_value("FriendlyName", &"Audio sink").unwrap();
+        assert_eq!(manager.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap().name.as_deref(),
+            Some("IINE GAMEPAD"));
+        // The address itself is not a name, and another peer keeps its own.
+        node.set_value("FriendlyName", &"12:34:56:78:9A:BC").unwrap();
+        assert!(manager.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap().name.is_none());
+        drop(manager);
+        hkcu.delete_subkey_all(&root).unwrap();
+    }
+
+    #[test]
+    fn leftover_registry_bond_is_purged_when_windows_lost_the_device_object() {
+        let (hkcu, root, manager) = identity_fixture("leftover-bond");
+        let keys = manager.open_bluetooth_keys().unwrap();
+        let adapter = keys.open_subkey_with_flags("001122334455", KEY_ALL_ACCESS).unwrap();
+        adapter.set_raw_value("123456789ABC", &winreg::RegValue {
+            bytes: vec![0x44; 16], vtype: RegType::REG_BINARY,
+        }).unwrap();
+        let other = BluetoothDevice::classic("AA:BB:CC:DD:EE:FF".into(), "55".repeat(16));
+        adapter.set_raw_value("AABBCCDDEEFF", &winreg::RegValue {
+            bytes: hex::decode(&other.classic.as_ref().unwrap().link_key).unwrap(), vtype: RegType::REG_BINARY,
+        }).unwrap();
+        manager.purge_registry_bond("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap();
+        assert!(adapter.get_raw_value("123456789ABC").is_err());
+        assert!(adapter.open_subkey("412233445566").is_err());
+        assert!(adapter.open_subkey("123456789abc").is_err());
+        let devices = manager.get_devices("00:11:22:33:44:55").unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].mac_address, other.mac_address);
+        // Purging an unknown peer is not an error and changes nothing.
+        manager.purge_registry_bond("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap();
+        assert_eq!(manager.get_devices("00:11:22:33:44:55").unwrap().len(), 1);
         drop(manager);
         hkcu.delete_subkey_all(&root).unwrap();
     }
