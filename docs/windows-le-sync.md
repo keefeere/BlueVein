@@ -23,6 +23,37 @@ binary can ignore the new marker. The automated tests cover the state machine,
 but physical unpair behavior on the dual-boot host is not yet verified; do not
 use a working InpuDeck/MX bond as the first live deletion test.
 
+### Removal failures observed on the dual-boot host (2026-09-21)
+
+`BluetoothRemoveDevice` returned `ERROR_NOT_FOUND` (1168) for a marked LE peer:
+the Windows stack had no device object, while BTHPORT still held its keys, which
+is exactly the record BlueVein reads and would keep re-exporting. That code is
+now treated as "already unpaired", and only the leftover BTHPORT key material
+for that identity is deleted: the Classic link-key value and every LE subkey
+whose `Address` resolves to the same peer. Other unpair errors still fail.
+
+A failed removal no longer aborts the run. The marker stays in EFI, the rest of
+the merge is published, and the failures are reported once as `UnfinishedRemovals`
+after the EFI write. Service startup continues into monitoring for that error
+only; any other startup failure still stops before the export monitor, so an
+incomplete import can never be mistaken for a clean state.
+
+## Device names
+
+Names are synchronized as ordinary shared metadata and never gate key handling.
+Windows reads the BTHPORT `Devices` name cache for both the identity and the
+LE storage record. That cache is empty for peers that never reported a name
+while paired, so an old LE bond can have keys and no cached name; BlueVein then
+reads `FriendlyName` from the PnP device container under `Enum\BTHLE` or
+`Enum\BTHENUM`. Per-service nodes are ignored: they name a profile, not a peer.
+Linux reads the BlueZ `Name` and falls back to a user `Alias`.
+
+A name discovered after the bond was exported is written into the existing EFI
+record, including when `update_reason` refuses to import that device's keys.
+Windows keeps names out of its registry projection, so a name change never
+rewrites registry keys, and unchanged names never rewrite EFI. Log lines carry
+`ADDRESS (Name)` so a journal identifies devices; key material is never logged.
+
 ## General Linux bond import
 
 Linux now imports complete missing bonds for locally known adapters, including

@@ -264,7 +264,10 @@ impl LinuxBluetoothManager {
 
         // Parse AddressType from [General] section
         if let Some(general_section) = sections.get("General") {
+            // BlueZ only stores Name after the peer reported one. A user alias
+            // is the name this system actually displays, so it is the fallback.
             device.name = general_section.get("Name")
+                .or_else(|| general_section.get("Alias"))
                 .filter(|name| useful_device_name(name, device_mac))
                 .cloned();
             if let Some(addr_type) = general_section.get("AddressType") {
@@ -725,6 +728,24 @@ mod general_import_tests {
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("Name=MX Keys"));
         assert!(content.contains("Alias=Desk keyboard"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_alias_is_exported_when_bluez_never_stored_a_name() {
+        let root = std::env::temp_dir().join(format!("bluevein-alias-{}", std::process::id()));
+        let path = root.join("info");
+        let device = bond();
+        LinuxBluetoothManager::write_device_file(&path, &device).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("Name="));
+        let aliased = content.replace("[General]\n", "[General]\nAlias=Desk keyboard\n");
+        fs::write(&path, &aliased).unwrap();
+        let parsed = LinuxBluetoothManager::parse_device_content(&aliased, &device.mac_address).unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("Desk keyboard"));
+        // A reported name still wins over the local alias.
+        let named = aliased.replace("[General]\n", "[General]\nName=MX Keys\n");
+        assert_eq!(LinuxBluetoothManager::parse_device_content(&named, &device.mac_address).unwrap().name.as_deref(), Some("MX Keys"));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -74,10 +74,15 @@ BlueVein keeps the pairing keys synchronized automatically. Reconnection still
 depends on the Bluetooth stack in each OS; a valid bond alone cannot repair a
 host-side connection bug.
 
-When Windows has a cached Bluetooth device name, BlueVein also carries it in
-the shared record. Linux uses it as the BlueZ `Name` while importing or updating
-the matching bond; an existing Linux `Alias` is preserved. Names are optional:
-older shared files and devices without a cached name remain valid.
+When either OS knows a Bluetooth device name, BlueVein also carries it in the
+shared record. Windows reads the BTHPORT name cache and falls back to the PnP
+friendly name it displays, which is often the only source for an old LE bond.
+Linux reads the BlueZ `Name` and falls back to a user `Alias`. Linux applies the
+shared name as the BlueZ `Name` while importing or updating the matching bond;
+an existing Linux `Alias` is preserved. A name found later is added to the
+existing shared record, even when its keys cannot be imported. Logs identify
+devices by address and name; names are optional, and older shared files and
+devices without a known name remain valid.
 
 When a running BlueVein instance has already observed and synchronized a local
 bond, then sees that bond removed, it writes a pending-deletion marker to EFI.
@@ -86,7 +91,11 @@ bonding key fingerprints match the removed bond, then removes the shared EFI
 record. A newly paired device at the same address is kept and replaces the old
 marker. A device missing on the first snapshot after boot does **not** imply
 deletion: older bonds from the other OS can still be imported. Failed or
-ambiguous unpair operations leave the marker in EFI for diagnosis. Install a
+ambiguous unpair operations leave the marker in EFI for diagnosis; they are
+reported after the run instead of stopping the synchronization of every other
+device, and the next cycle retries them. When Windows reports that it has no
+paired device object for the address, BlueVein removes only the leftover
+BTHPORT key material that would otherwise resurrect the bond. Install a
 version with this behavior on **both** operating systems before using deletion
 as a cross-OS cleanup mechanism.
 

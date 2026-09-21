@@ -41,8 +41,13 @@ async fn run_service() -> Result<(), Box<dyn Error>> {
     let mut sync_manager = SyncManager::new(bt_manager, efi_context);
 
     log!("[BlueVein] Performing initial bidirectional sync...");
-    // Use bidirectional sync to properly merge EFI and system state
-    sync_manager.sync_bidirectional()?;
+    // Use bidirectional sync to properly merge EFI and system state.
+    // A bond that refused to unpair is retried by the next cycle; every other
+    // startup failure still stops the service before it monitors exports.
+    if let Err(e) = sync_manager.sync_bidirectional() {
+        if e.downcast_ref::<crate::sync::UnfinishedRemovals>().is_none() { return Err(e); }
+        log!("[BlueVein] Continuing after {}", e);
+    }
 
     // Start monitoring Bluetooth changes
     log!("[BlueVein] Starting Bluetooth monitoring...");

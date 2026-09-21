@@ -76,7 +76,12 @@ pub fn run_sync_loop() -> Result<(), Box<dyn Error>> {
     let mut sync_manager = SyncManager::new(bt_manager, efi_context);
 
     log!("[BlueVein] Performing initial bidirectional sync...");
-    sync_manager.sync_bidirectional()?;
+    // A bond that refused to unpair keeps its marker and is retried by the next
+    // cycle; every other startup failure still stops before monitoring.
+    if let Err(e) = sync_manager.sync_bidirectional() {
+        if e.downcast_ref::<crate::sync::UnfinishedRemovals>().is_none() { return Err(e); }
+        log!("[BlueVein] Continuing after {}", e);
+    }
 
     let running = Arc::new(AtomicBool::new(true));
 
