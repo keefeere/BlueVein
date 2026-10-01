@@ -93,8 +93,12 @@ marker. A device missing on the first snapshot after boot does **not** imply
 deletion: older bonds from the other OS can still be imported. Failed or
 ambiguous unpair operations leave the marker in EFI for diagnosis; they are
 reported after the run instead of stopping the synchronization of every other
-device, and the next cycle retries them. When Windows reports that it has no
-paired device object for the address, BlueVein removes only the leftover
+device, and the next cycle retries them. A transport switch with no comparable
+key requires manual marker resolution. If EFI already contains a different bond
+generation when the local one is removed, the shared record is preserved and
+may be imported again rather than deleting an unverified bond. When Windows
+reports that it has no paired device object for the address, BlueVein removes
+only the leftover
 BTHPORT key material that would otherwise resurrect the bond. Install a
 version with this behavior on **both** operating systems before using deletion
 as a cross-OS cleanup mechanism.
@@ -110,7 +114,7 @@ as a cross-OS cleanup mechanism.
 | 💾 **EFI access** | Uses the mounted EFI filesystem on Linux when available; otherwise [fat32-raw](https://github.com/meowrch/fat32-raw) |
 | 🛡️ **Security** | Works at system level with administrator privileges |
 | 📡 **Real-time monitoring** | Tracks changes instantly |
-| 🔍 **Periodic checking** | Checks for updates from the other OS every 30 seconds |
+| 🔍 **Periodic checking** | Both services check for updates from the other OS every 30 seconds |
 
 </div>
 
@@ -369,7 +373,7 @@ Monitor->>OS: Applies new keys to existing devices
 - **On boot:** BlueVein checks keys in EFI and updates them for devices present in the system. New devices from the system are added to EFI
 - **On new pairing:** The key is immediately saved to EFI and becomes available to the other OS
 - **On removal:** A bond that disappears after BlueVein observed it locally gets a pending-deletion marker in EFI. The other OS removes its matching bond, then clears the EFI record. A missing bond at startup is not treated as a deletion; mismatched keys are never removed automatically. See [the deletion protocol](docs/windows-le-sync.md#pairing-removal-protocol-candidate-2026-09-20).
-- **Periodically:** Checks for changes every 30 seconds and applies key updates from EFI
+- **Periodically:** Both services first export pending local changes, then check EFI every 30 seconds and apply key updates from the other OS
 
 ## <a name="technical-details"></a>🔬 Technical Details
 

@@ -34,7 +34,22 @@ pub struct SyncManager {
     store: Box<dyn ConfigStore>,
 }
 
+/// Conflicting fields have different authoritative sources depending on why a
+/// merge runs. Startup/import applies shared EFI state; a live local change
+/// exports the newly observed local bond while retaining unrepresented shared
+/// metadata.
+#[derive(Clone, Copy)]
+enum MergePriority {
+    Shared,
+    Local,
+}
+
 impl SyncManager {
+    #[cfg(test)]
+    pub(crate) fn with_test_store(bt_manager: Box<dyn BluetoothManager>, store: Box<dyn ConfigStore>) -> Self {
+        Self { bt_manager, store }
+    }
+
     /// Create a new sync manager
     pub fn new(bt_manager: Box<dyn BluetoothManager>, efi_context: EfiContext) -> Self {
         Self {
@@ -69,34 +84,35 @@ impl SyncManager {
     /// - When merging CSRK keys with the same key value, takes MAX counter
     /// - This prevents counter rollback and protects against replay attacks
     /// - Critical because Windows doesn't persist Counter in registry
-    fn merge_devices(
-        system_device: &BluetoothDevice,
-        efi_device: &BluetoothDevice,
-    ) -> BluetoothDevice {
-        // Use base merge as foundation
-        let mut merged = system_device.merge_with(efi_device);
+    fn merge_devices(retained: &BluetoothDevice, preferred: &BluetoothDevice) -> BluetoothDevice {
+        // `merge_with` fills absent fields from the receiver and lets its
+        // argument win conflicts.
+        let mut merged = retained.merge_with(preferred);
 
         // Smart CSRK Counter handling
         if let Some(ref mut merged_le) = merged.le {
             // Merge CSRK Local with MAX Counter preservation
             let csrk_local = match (
-                &system_device
+                &retained
                     .le
                     .as_ref()
                     .and_then(|le| le.csrk_local.as_ref()),
-                &efi_device.le.as_ref().and_then(|le| le.csrk_local.as_ref()),
+                &preferred.le.as_ref().and_then(|le| le.csrk_local.as_ref()),
             ) {
-                (Some(sys_csrk), Some(efi_csrk)) if sys_csrk.key == efi_csrk.key => {
+                (Some(retained_csrk), Some(preferred_csrk))
+                    if retained_csrk.key == preferred_csrk.key =>
+                {
                     // Same key - take MAX Counter to prevent rollback
                     Some(CsrkKey {
-                        key: sys_csrk.key.clone(),
-                        counter: sys_csrk.counter.max(efi_csrk.counter),
-                        authenticated: sys_csrk.authenticated || efi_csrk.authenticated,
+                        key: retained_csrk.key.clone(),
+                        counter: retained_csrk.counter.max(preferred_csrk.counter),
+                        authenticated: retained_csrk.authenticated
+                            || preferred_csrk.authenticated,
                     })
                 }
-                (Some(_sys_csrk), Some(efi_csrk)) => {
-                    // Different keys - prefer EFI (newer source)
-                    Some((*efi_csrk).clone())
+                (Some(_), Some(preferred_csrk)) => {
+                    // Different keys follow the caller's explicit priority.
+                    Some((*preferred_csrk).clone())
                 }
                 (Some(csrk), None) | (None, Some(csrk)) => Some((*csrk).clone()),
                 (None, None) => None,
@@ -104,21 +120,22 @@ impl SyncManager {
 
             // Merge CSRK Remote with MAX Counter preservation
             let csrk_remote = match (
-                &system_device
+                &retained
                     .le
                     .as_ref()
                     .and_then(|le| le.csrk_remote.as_ref()),
-                &efi_device
+                &preferred
                     .le
                     .as_ref()
                     .and_then(|le| le.csrk_remote.as_ref()),
             ) {
-                (Some(sys_csrk), Some(efi_csrk)) if sys_csrk.key == efi_csrk.key => Some(CsrkKey {
-                    key: sys_csrk.key.clone(),
-                    counter: sys_csrk.counter.max(efi_csrk.counter),
-                    authenticated: sys_csrk.authenticated || efi_csrk.authenticated,
+                (Some(retained_csrk), Some(preferred_csrk))
+                    if retained_csrk.key == preferred_csrk.key => Some(CsrkKey {
+                    key: retained_csrk.key.clone(),
+                    counter: retained_csrk.counter.max(preferred_csrk.counter),
+                    authenticated: retained_csrk.authenticated || preferred_csrk.authenticated,
                 }),
-                (Some(_sys_csrk), Some(efi_csrk)) => Some((*efi_csrk).clone()),
+                (Some(_), Some(preferred_csrk)) => Some((*preferred_csrk).clone()),
                 (Some(csrk), None) | (None, Some(csrk)) => Some((*csrk).clone()),
                 (None, None) => None,
             };
@@ -128,6 +145,29 @@ impl SyncManager {
         }
 
         merged
+    }
+
+    fn merge_for(
+        &self,
+        local: &BluetoothDevice,
+        shared: &BluetoothDevice,
+        priority: MergePriority,
+    ) -> BluetoothDevice {
+        match priority {
+            MergePriority::Shared => {
+                let mut merged = Self::merge_devices(local, shared);
+                merged.name = self.bt_manager.choose_shared_name(local, shared);
+                merged
+            }
+            MergePriority::Local => {
+                let prepared = self.bt_manager.prepare_local_export(local, shared);
+                let mut merged = Self::merge_devices(shared, &prepared);
+                // A confirmed replacement bond cancels only the marker. Shared
+                // fields that this backend cannot observe remain intact.
+                merged.pending_deletion = None;
+                merged
+            }
+        }
     }
 
     /// Perform intelligent bidirectional synchronization
@@ -145,10 +185,25 @@ impl SyncManager {
     pub fn sync_bidirectional(&mut self) -> Result<(), Box<dyn Error>> {
         let result = self.sync_bidirectional_mode(true, true);
         let applied = self.bt_manager.apply_pending();
-        // A hard failure outranks a removal that the next cycle can retry.
-        match result {
-            Err(e) if e.downcast_ref::<UnfinishedRemovals>().is_none() => Err(e),
-            result => applied.and(result),
+        if let Err(error) = &applied {
+            log!(
+                "[BlueVein] Failed to activate pending Bluetooth changes after synchronization: {}",
+                error
+            );
+        }
+        match (result, applied) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(format!(
+                "Failed to activate pending Bluetooth changes: {}",
+                error
+            )
+            .into()),
+            (Err(sync_error), Err(apply_error)) => Err(format!(
+                "Synchronization failed: {}; additionally failed to activate pending Bluetooth changes: {}",
+                sync_error, apply_error
+            )
+            .into()),
         }
     }
 
@@ -225,10 +280,95 @@ impl SyncManager {
         let final_config = if let Some(mut efi_cfg) = efi_config {
             log!("[BlueVein] Merging EFI config with system state");
 
+            // BlueZ must remain alive while removals use its D-Bus API. Finish
+            // every eligible removal before any backend can begin a batched key
+            // import (Linux stops bluetoothd on its first set_device call).
+            let mut completed_deletions: HashSet<(String, String)> = HashSet::new();
+            for adapter_mac in &adapters {
+                let Some(efi_devices) = efi_cfg.get_adapter_devices(adapter_mac) else {
+                    continue;
+                };
+                let Some(system_devices) = system_config.get_adapter_devices(adapter_mac) else {
+                    continue;
+                };
+                for (device_mac, efi_device) in efi_devices {
+                    let Some(marker) = &efi_device.pending_deletion else {
+                        continue;
+                    };
+                    if !matches!(marker.source.as_str(), "linux" | "windows")
+                        || marker.source == self.bt_manager.platform_id()
+                    {
+                        continue;
+                    }
+                    let local_device = system_devices.get(device_mac);
+                    let label = describe(device_mac, [local_device, Some(efi_device)]);
+                    match local_device {
+                        Some(local) if marker.matches_bond(local) => {
+                            if !apply {
+                                log!("[BlueVein] AUDIT would remove matching bond {}", label);
+                                continue;
+                            }
+                            if !allow_local_writes {
+                                return Err(format!(
+                                    "EFI-only repair would remove local bond {}",
+                                    label
+                                )
+                                .into());
+                            }
+                            // A peer that refuses to unpair keeps its marker and
+                            // is reported after the run; unrelated work continues.
+                            match self.bt_manager.remove_device(adapter_mac, device_mac) {
+                                Ok(()) => {
+                                    match self.bt_manager.get_devices(adapter_mac) {
+                                        Ok(devices) if devices.iter().any(|device| {
+                                            device.mac_address.eq_ignore_ascii_case(device_mac)
+                                        }) => {
+                                            log!(
+                                                "[BlueVein] Local bond {} still exists after removal",
+                                                label
+                                            );
+                                            deferred.push(format!(
+                                                "Local bond {} still exists after removal",
+                                                label
+                                            ));
+                                        }
+                                        Ok(_) => {
+                                            completed_deletions
+                                                .insert((adapter_mac.clone(), device_mac.clone()));
+                                        }
+                                        Err(error) => {
+                                            log!(
+                                                "[BlueVein] Could not verify removal of {}; deferring completion: {}",
+                                                label,
+                                                error
+                                            );
+                                            deferred.push(format!(
+                                                "Could not verify removal of {}: {}",
+                                                label, error
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log!("[BlueVein] Could not remove bond {}: {}", label, e);
+                                    deferred.push(format!(
+                                        "Could not remove bond {}: {}",
+                                        label, e
+                                    ));
+                                }
+                            }
+                        }
+                        None => {
+                            completed_deletions.insert((adapter_mac.clone(), device_mac.clone()));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+
             // Step 1: Apply EFI keys to existing system devices
             for adapter_mac in &adapters {
                 let mut merged_devices = Vec::new();
-                let mut completed_deletions = HashSet::new();
                 if let Some(efi_devices) = efi_cfg.get_adapter_devices(adapter_mac) {
                     if let Some(system_devices) = system_config.get_adapter_devices(adapter_mac) {
                         log!("[BlueVein] Processing adapter {}", adapter_mac);
@@ -237,6 +377,10 @@ impl SyncManager {
                             let local_device = system_devices.get(device_mac);
                             let label = describe(device_mac, [local_device, Some(efi_device)]);
                             if let Some(marker) = &efi_device.pending_deletion {
+                                let deletion_id = (adapter_mac.clone(), device_mac.clone());
+                                if completed_deletions.contains(&deletion_id) {
+                                    continue;
+                                }
                                 if !matches!(marker.source.as_str(), "linux" | "windows") {
                                     log!("[BlueVein] Unknown deletion marker source for {}; leaving it untouched", label);
                                     continue;
@@ -244,7 +388,11 @@ impl SyncManager {
                                 if let Some(local) = local_device {
                                     if marker.comparable_with(local) && !marker.matches_bond(local) {
                                         log!("[BlueVein] New bond {} replaces an older deletion marker", label);
-                                        merged_devices.push(local.clone());
+                                        merged_devices.push(self.merge_for(
+                                            local,
+                                            efi_device,
+                                            MergePriority::Local,
+                                        ));
                                         continue;
                                     }
                                 }
@@ -253,42 +401,22 @@ impl SyncManager {
                                     continue;
                                 }
                                 match local_device {
-                                    Some(local) if marker.matches_bond(local) => {
-                                        if !apply {
-                                            log!("[BlueVein] AUDIT would remove matching bond {}", label);
-                                            continue;
-                                        }
-                                        if !allow_local_writes { return Err(format!("EFI-only repair would remove local bond {}", label).into()); }
-                                        // A peer that refuses to unpair keeps its marker and is
-                                        // reported after the run; other devices still synchronize.
-                                        match self.bt_manager.remove_device(adapter_mac, device_mac) {
-                                            Ok(()) => {
-                                                if self.bt_manager.get_devices(adapter_mac)?.iter()
-                                                    .any(|device| device.mac_address == *device_mac) {
-                                                    log!("[BlueVein] Local bond {} still exists after removal", label);
-                                                    deferred.push(format!("Local bond {} still exists after removal", label));
-                                                } else {
-                                                    completed_deletions.insert(device_mac.clone());
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log!("[BlueVein] Could not remove bond {}: {}", label, e);
-                                                deferred.push(format!("Could not remove bond {}: {}", label, e));
-                                            }
-                                        }
-                                    }
+                                    Some(local) if marker.matches_bond(local) => {}
                                     Some(_) => {
-                                        log!("[BlueVein] Bond {} cannot be compared with deletion marker; leaving both records untouched", label);
+                                        log!("[BlueVein] Bond {} uses different transports than its deletion marker; leaving both records untouched. Re-pair it on the marker's source OS, or back up bluevein.json and clear the stale marker after verifying the local bond", label);
                                     }
-                                    None => { completed_deletions.insert(device_mac.clone()); }
+                                    None => {}
                                 }
                                 continue;
                             }
                             if let Some(system_device) = local_device {
                                 // Device exists in both EFI and system
                                 // Merge to combine both Classic and LE keys if needed
-                                let mut merged = Self::merge_devices(system_device, efi_device);
-                                merged.name = self.bt_manager.choose_shared_name(system_device, efi_device);
+                                let merged = self.merge_for(
+                                    system_device,
+                                    efi_device,
+                                    MergePriority::Shared,
+                                );
                                 let label = describe(device_mac, [Some(&merged)]);
 
                                 if let Some(reason) = self.bt_manager.update_reason(system_device, &merged) {
@@ -341,7 +469,12 @@ impl SyncManager {
                 for device in merged_devices {
                     efi_cfg.update_device(adapter_mac.clone(), device);
                 }
-                for device_mac in &completed_deletions {
+                let completed_for_adapter: Vec<_> = completed_deletions
+                    .iter()
+                    .filter(|(adapter, _)| adapter == adapter_mac)
+                    .map(|(_, device)| device.clone())
+                    .collect();
+                for device_mac in &completed_for_adapter {
                     let label = describe(device_mac, [efi_cfg.get_device(adapter_mac, device_mac)]);
                     efi_cfg.remove_device(adapter_mac, device_mac);
                     log!("[BlueVein] Completed deletion of bond {} on both operating systems", label);
@@ -353,7 +486,9 @@ impl SyncManager {
 
                     let efi_devices = efi_cfg.get_adapter_devices(adapter_mac);
                     for (device_mac, system_device) in system_devices {
-                        if completed_deletions.contains(device_mac) { continue; }
+                        if completed_deletions.contains(&(adapter_mac.clone(), device_mac.clone())) {
+                            continue;
+                        }
                         let device_in_efi = efi_devices
                             .map(|devices| devices.contains_key(device_mac))
                             .unwrap_or(false);
@@ -539,17 +674,35 @@ impl SyncManager {
         );
         // Local change wins for represented fields; retain other-platform metadata.
         let device = match config.get_device(adapter_mac, &device.mac_address) {
-            Some(shared) if shared.pending_deletion.as_ref().is_some_and(|marker| marker.matches_bond(&device)) => {
-                // A cached info-file change is not a new pairing.
-                return Ok(());
-            }
             Some(shared) if shared.pending_deletion.is_some() => {
-                log!("[BlueVein] New bond for {}; cancelling {} deletion marker",
-                    describe(&device.mac_address, [Some(&device), Some(shared)]),
-                    shared.pending_deletion.as_ref().unwrap().source);
-                device
+                let marker = shared.pending_deletion.as_ref().unwrap();
+                let label = describe(&device.mac_address, [Some(&device), Some(shared)]);
+                if !matches!(marker.source.as_str(), "linux" | "windows") {
+                    log!(
+                        "[BlueVein] Unknown deletion marker source for {}; leaving it untouched",
+                        label
+                    );
+                    return Ok(());
+                }
+                if marker.matches_bond(&device) {
+                    // A cached info-file change is not a new pairing.
+                    return Ok(());
+                }
+                if !marker.comparable_with(&device) {
+                    log!(
+                        "[BlueVein] Bond {} uses different transports than its deletion marker; leaving both records untouched. Re-pair it on the marker's source OS, or back up bluevein.json and clear the stale marker after verifying the local bond",
+                        label
+                    );
+                    return Ok(());
+                }
+                log!(
+                    "[BlueVein] New bond for {}; cancelling {} deletion marker",
+                    label,
+                    marker.source
+                );
+                self.merge_for(&device, shared, MergePriority::Local)
             }
-            Some(shared) => Self::merge_devices(shared, &self.bt_manager.prepare_local_export(&device, shared)),
+            Some(shared) => self.merge_for(&device, shared, MergePriority::Local),
             None => device,
         };
         if config.get_device(adapter_mac, &device.mac_address) == Some(&device) {
@@ -590,7 +743,14 @@ impl SyncManager {
         }
         let mut config = self.store.read()?;
         let Some(shared) = config.get_device(adapter_mac, device_mac) else { return Ok(()); };
-        if shared.pending_deletion.is_some() || !shared.same_bond_as(previous) {
+        if shared.pending_deletion.is_some() {
+            return Ok(());
+        }
+        if !shared.same_bond_as(previous) {
+            log!(
+                "[BlueVein] Not marking removal of {}: EFI contains a different bond generation. The shared bond is preserved and may be imported again; re-pair or export the intended bond before retrying",
+                describe(device_mac, [Some(shared), Some(previous)])
+            );
             return Ok(());
         }
         let mut marked = shared.clone();
@@ -631,10 +791,15 @@ mod tests {
         activations: usize,
         pending: bool,
         fail_local_write: bool,
+        fail_post_removal_read_once: bool,
+        fail_activation: bool,
+        fail_shared_write: bool,
         discard_shared_write: bool,
         fail_read_after_write: bool,
         fail_removal: bool,
         block_updates: bool,
+        prepared_exports: usize,
+        operations: Vec<String>,
     }
     struct Backend(Arc<Mutex<State>>);
     impl BluetoothManager for Backend {
@@ -645,13 +810,28 @@ mod tests {
         }
         fn apply_pending(&mut self) -> Result<(), Box<dyn Error>> {
             let mut state = self.0.lock().unwrap();
-            if state.pending { state.activations += 1; state.pending = false; }
+            if state.pending {
+                state.activations += 1;
+                state.operations.push("apply".into());
+                if state.fail_activation {
+                    return Err("simulated Bluetooth activation failure".into());
+                }
+                state.pending = false;
+            }
             Ok(())
+        }
+        fn prepare_local_export(&self, local: &BluetoothDevice, _: &BluetoothDevice) -> BluetoothDevice {
+            self.0.lock().unwrap().prepared_exports += 1;
+            local.clone()
         }
         fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>> { Ok(vec!["adapter".into()]) }
         fn get_devices(&self, _: &str) -> Result<Vec<BluetoothDevice>, Box<dyn Error>> {
-            let state = self.0.lock().unwrap();
+            let mut state = self.0.lock().unwrap();
             if state.fail_local_read { return Err("simulated unreadable registry".into()); }
+            if state.fail_post_removal_read_once && state.local_removals > 0 {
+                state.fail_post_removal_read_once = false;
+                return Err("simulated transient post-unpair read failure".into());
+            }
             Ok(state.local.values().cloned().collect())
         }
         fn get_device(&self, _: &str, mac: &str) -> Result<BluetoothDevice, Box<dyn Error>> {
@@ -663,6 +843,7 @@ mod tests {
             state.local.insert(device.mac_address.clone(), device.clone());
             state.local_writes += 1;
             state.pending = true;
+            state.operations.push(format!("set:{}", device.mac_address));
             Ok(())
         }
         fn remove_device(&mut self, _: &str, mac: &str) -> Result<(), Box<dyn Error>> {
@@ -670,6 +851,7 @@ mod tests {
             if state.fail_removal { return Err("simulated unpair failure".into()); }
             state.local.remove(mac);
             state.local_removals += 1;
+            state.operations.push(format!("remove:{}", mac));
             Ok(())
         }
         fn update_reason(&self, _: &BluetoothDevice, _: &BluetoothDevice) -> Option<String> {
@@ -687,6 +869,11 @@ mod tests {
         }
         fn write(&mut self, config: &BlueVeinConfig) -> Result<(), efi::EfiError> {
             let mut state = self.0.lock().unwrap();
+            if state.fail_shared_write {
+                return Err(efi::EfiError::WriteError(
+                    "simulated EFI write failure".into(),
+                ));
+            }
             if !state.discard_shared_write { state.shared = config.clone(); }
             state.shared_writes += 1;
             Ok(())
@@ -757,6 +944,47 @@ mod tests {
     }
 
     #[test]
+    fn transient_read_after_unpair_defers_completion_without_aborting_the_batch() {
+        let old = device("11");
+        let mut shared = old.clone();
+        shared.pending_deletion = Some(PendingDeletion::from_observed("windows", &shared));
+        let (mut sync, state) = setup(old, shared);
+        {
+            let mut s = state.lock().unwrap();
+            s.fail_post_removal_read_once = true;
+            let mut other = device("33");
+            other.mac_address = "headphones".into();
+            s.local.insert(other.mac_address.clone(), other);
+        }
+
+        let error = sync.sync_bidirectional().unwrap_err();
+        assert!(error.downcast_ref::<UnfinishedRemovals>().is_some());
+        let error = error.to_string();
+        assert!(error.contains("Could not verify removal"), "{error}");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.local_removals, 1);
+            assert!(!s.local.contains_key("phone"));
+            assert!(s
+                .shared
+                .get_device("adapter", "phone")
+                .unwrap()
+                .pending_deletion
+                .is_some());
+            assert!(s.shared.get_device("adapter", "headphones").is_some());
+            assert_eq!(s.shared_writes, 1);
+        }
+
+        sync.sync_bidirectional().unwrap();
+        assert!(state
+            .lock()
+            .unwrap()
+            .shared
+            .get_device("adapter", "phone")
+            .is_none());
+    }
+
+    #[test]
     fn existing_shared_record_gains_a_name_discovered_later() {
         let mut local = device("11");
         local.name = Some("IINE GAMEPAD".into());
@@ -804,6 +1032,103 @@ mod tests {
         assert_eq!(state.local_removals, 0);
         assert_eq!(state.local.get("phone"), Some(&device("22")));
         assert_eq!(state.shared.get_device("adapter", "phone"), Some(&device("22")));
+    }
+
+    #[test]
+    fn live_repair_cancels_only_marker_and_preserves_shared_metadata() {
+        let mut shared = device("22");
+        shared.name = Some("Headset".into());
+        shared.le.as_mut().unwrap().irk = Some("33".repeat(16));
+        shared.le.as_mut().unwrap().irk_encoding = Some("windows".into());
+        shared.le.as_mut().unwrap().peripheral_ltk = Some(LeLongTermKey {
+            key: "44".repeat(16),
+            authenticated: Some(2),
+            enc_size: Some(16),
+            ediv: Some(0),
+            rand: Some(0),
+        });
+        shared.pending_deletion = Some(PendingDeletion::from_observed("windows", &device("11")));
+        let (mut sync, state) = setup(device("22"), shared);
+
+        sync.handle_device_change("adapter", "phone").unwrap();
+
+        let state = state.lock().unwrap();
+        let exported = state.shared.get_device("adapter", "phone").unwrap();
+        let le = exported.le.as_ref().unwrap();
+        assert!(exported.pending_deletion.is_none());
+        assert_eq!(exported.name.as_deref(), Some("Headset"));
+        assert_eq!(le.irk.as_deref(), Some("33333333333333333333333333333333"));
+        assert_eq!(le.peripheral_ltk.as_ref().unwrap().key, "44".repeat(16));
+        assert_eq!(le.ltk.as_ref().unwrap().key, "22".repeat(16));
+        assert_eq!(state.prepared_exports, 1);
+        assert_eq!(state.shared_writes, 1);
+    }
+
+    #[test]
+    fn startup_repair_cancellation_uses_the_same_metadata_preserving_merge() {
+        let mut shared = device("22");
+        shared.name = Some("Headset".into());
+        shared.le.as_mut().unwrap().irk = Some("33".repeat(16));
+        shared.le.as_mut().unwrap().irk_encoding = Some("windows".into());
+        shared.pending_deletion = Some(PendingDeletion::from_observed("windows", &device("11")));
+        let (mut sync, state) = setup(device("22"), shared);
+
+        sync.sync_bidirectional().unwrap();
+
+        let state = state.lock().unwrap();
+        let exported = state.shared.get_device("adapter", "phone").unwrap();
+        assert!(exported.pending_deletion.is_none());
+        assert_eq!(exported.name.as_deref(), Some("Headset"));
+        assert_eq!(
+            exported.le.as_ref().unwrap().irk.as_deref(),
+            Some("33333333333333333333333333333333")
+        );
+        assert_eq!(state.prepared_exports, 1);
+        assert_eq!(state.local_writes, 0);
+        assert_eq!(state.shared_writes, 1);
+    }
+
+    #[test]
+    fn live_change_does_not_cancel_an_uncomparable_marker() {
+        let mut shared = device("22");
+        shared.name = Some("Shared name".into());
+        let old_classic = BluetoothDevice::classic("phone".into(), "11".repeat(16));
+        shared.pending_deletion = Some(PendingDeletion::from_observed("windows", &old_classic));
+        let before = shared.clone();
+        let (mut sync, state) = setup(device("22"), shared);
+
+        sync.handle_device_change("adapter", "phone").unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.shared.get_device("adapter", "phone"), Some(&before));
+        assert_eq!(state.prepared_exports, 0);
+        assert_eq!(state.shared_writes, 0);
+    }
+
+    #[test]
+    fn removals_finish_before_any_batched_import_write() {
+        let old = device("11");
+        let mut marked = old.clone();
+        marked.pending_deletion = Some(PendingDeletion::from_observed("windows", &old));
+        let (mut sync, state) = setup(old, marked);
+        {
+            let mut state = state.lock().unwrap();
+            state.allow_missing = true;
+            let mut keyboard = device("33");
+            keyboard.mac_address = "keyboard".into();
+            state.shared.update_device("adapter".into(), keyboard);
+        }
+
+        sync.sync_bidirectional().unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.operations,
+            vec!["remove:phone", "set:keyboard", "apply"]
+        );
+        assert_eq!(state.activations, 1);
+        assert!(!state.local.contains_key("phone"));
+        assert!(state.local.contains_key("keyboard"));
     }
 
     #[test]
@@ -953,6 +1278,30 @@ mod tests {
         assert_eq!(state.shared_writes, 0);
         assert_eq!(state.local_writes, 0);
         assert_eq!(state.local.get("phone"), Some(&device("11")));
+    }
+
+    #[test]
+    fn activation_failure_is_reported_alongside_the_original_sync_error() {
+        let (mut sync, state) = setup(device("11"), device("22"));
+        {
+            let mut s = state.lock().unwrap();
+            s.fail_activation = true;
+            s.fail_shared_write = true;
+            let mut other = device("33");
+            other.mac_address = "headphones".into();
+            s.local.insert(other.mac_address.clone(), other);
+        }
+
+        let error = sync.sync_bidirectional().unwrap_err().to_string();
+        assert!(error.contains("simulated EFI write failure"), "{error}");
+        assert!(
+            error.contains("simulated Bluetooth activation failure"),
+            "{error}"
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(state.activations, 1);
+        assert!(state.pending);
+        assert!(state.operations.contains(&"apply".to_string()));
     }
 
     #[test]

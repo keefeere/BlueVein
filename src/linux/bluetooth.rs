@@ -8,8 +8,11 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const BLUETOOTH_LIB_PATH: &str = "/var/lib/bluetooth";
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct LinuxBluetoothManager { pending: bool }
 
@@ -65,6 +68,27 @@ fn missing_record_reason(device: &BluetoothDevice) -> Option<String> {
 impl LinuxBluetoothManager {
     pub fn new() -> Result<Self, Box<dyn Error>> {
         Ok(Self { pending: false })
+    }
+
+    fn start_bluetooth_service(context: &str) -> Result<(), Box<dyn Error>> {
+        let status = Command::new("systemctl")
+            .args(["start", "bluetooth"])
+            .status()
+            .map_err(|error| format!("{}: could not run systemctl: {}", context, error))?;
+        if !status.success() {
+            return Err(format!(
+                "{}: systemctl start bluetooth exited with {}",
+                context, status
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Recover from a previous process dying after it stopped bluetoothd for
+    /// an atomic import but before the in-memory batch could be activated.
+    pub fn ensure_bluetooth_running() -> Result<(), Box<dyn Error>> {
+        Self::start_bluetooth_service("Bluetooth startup reconciliation failed")
     }
 
     fn get_adapter_info_path(adapter_mac: &str) -> PathBuf {
@@ -497,7 +521,16 @@ impl LinuxBluetoothManager {
         // Publish a complete private record atomically; never expose partial keys.
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let temporary = device_dir.join(".bluevein-info.tmp");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temporary = device_dir.join(format!(
+            ".bluevein-info.{}.{}.{}.tmp",
+            std::process::id(),
+            nonce,
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
         let published = (|| -> Result<(), Box<dyn Error>> {
             file.write_all(content.as_bytes())?;
@@ -560,8 +593,7 @@ impl BluetoothManager for LinuxBluetoothManager {
 
     fn apply_pending(&mut self) -> Result<(), Box<dyn Error>> {
         if self.pending {
-            let status = Command::new("systemctl").args(["start", "bluetooth"]).status()?;
-            if !status.success() { return Err("Bluetooth batch activation failed".into()); }
+            Self::start_bluetooth_service("Bluetooth batch activation failed")?;
             self.pending = false;
         }
         Ok(())
@@ -708,6 +740,37 @@ mod general_import_tests {
             LinuxBluetoothManager::write_device_file(&path, &d).unwrap();
             assert!(fs::read_to_string(&path).unwrap().contains("Keep=value"));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_legacy_temporary_file_does_not_block_atomic_publish() {
+        let root = std::env::temp_dir().join(format!(
+            "bluevein-stale-temp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("info");
+        fs::create_dir_all(&root).unwrap();
+        let stale = root.join(".bluevein-info.tmp");
+        fs::write(&stale, "orphaned partial data").unwrap();
+
+        let device = bond();
+        LinuxBluetoothManager::write_device_file(&path, &device).unwrap();
+
+        assert!(path.exists());
+        assert!(stale.exists());
+        assert_eq!(
+            LinuxBluetoothManager::parse_device_content(
+                &fs::read_to_string(&path).unwrap(),
+                &device.mac_address
+            )
+            .unwrap(),
+            device
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
